@@ -463,6 +463,7 @@ fn push_proximity_pairs(
     max_dist: f32,
     k: usize,
     max_angle_rad: f32,
+    weighted_cost: bool,
 ) -> usize {
     let live = live_indices(prims);
     if live.len() < 2 {
@@ -504,7 +505,11 @@ fn push_proximity_pairs(
             let pb = &prims[b as usize];
             let (_q, prim_fit, vol, wvol, _vidx) =
                 merge_pair(pa, pb, mesh_verts, enabled);
-            let cost = vol - (pa.volume + pb.volume);
+            let cost = if weighted_cost {
+                wvol - (pa.weighted_volume + pb.weighted_volume)
+            } else {
+                vol - (pa.volume + pb.volume)
+            };
             if cost > volume_threshold {
                 return None;
             }
@@ -533,6 +538,7 @@ fn push_all_pairs(
     pq: &mut BinaryHeap<PqEntry>,
     volume_threshold: f32,
     enabled: PrimMask,
+    weighted_cost: bool,
 ) -> usize {
     let live = live_indices(prims);
     let mut pairs: Vec<(u32, u32)> = Vec::new();
@@ -552,7 +558,11 @@ fn push_all_pairs(
             let pa = &prims[a as usize];
             let pb = &prims[b as usize];
             let (_q, prim_fit, vol, wvol, _vidx) = merge_pair(pa, pb, mesh_verts, enabled);
-            let cost = vol - (pa.volume + pb.volume);
+            let cost = if weighted_cost {
+                wvol - (pa.weighted_volume + pb.weighted_volume)
+            } else {
+                vol - (pa.volume + pb.volume)
+            };
             if cost > volume_threshold {
                 return None;
             }
@@ -618,6 +628,13 @@ pub struct DecompOpts {
     /// `k_nearest` neighbours per component, and rejecting pairs whose
     /// dominant normals differ by more than `max_angle_rad`.
     pub proximity: Option<(f32, usize, f32)>,
+    /// Use the weighted volume in priority-queue ordering (cost = ΔwV
+    /// instead of ΔV). Trades surface fit for runtime/memory cost
+    /// (matches what the paper's per-shape weights represent). Helps
+    /// near-convex / organic meshes (rocks: ~10-20% Hausdorff drop) at
+    /// the cost of detail-heavy meshes (vehicles: 10-37% Hausdorff
+    /// regression).
+    pub weighted_cost: bool,
 }
 
 /// Fraction of stratified-grid samples inside `prim` that are deeper than
@@ -756,11 +773,15 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
             exp.iter().map(|&e| e > 0.05).collect()
         });
         let mask_ref = face_shell_mask.as_deref();
-        Some(crate::mesh::build_sharp_edges(
-            mesh,
-            std::f32::consts::FRAC_PI_6,
-            mask_ref,
-        ))
+        // Per-mesh adaptive threshold: 95th-percentile dihedral, clamped
+        // to [30°, 60°]. Avoids over-flagging small ridges on organic
+        // meshes (rocks, terrain) where most dihedrals are tiny.
+        let thresh = crate::mesh::adaptive_sharp_threshold(mesh);
+        eprintln!(
+            "sharp-edge threshold: {:.1}° (adaptive 95th-percentile dihedral)",
+            thresh.to_degrees()
+        );
+        Some(crate::mesh::build_sharp_edges(mesh, thresh, mask_ref))
     } else {
         None
     };
@@ -783,7 +804,11 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
             let pb = &prims[n as usize];
             let (_q, prim_fit, vol, wvol, _vidx) =
                 merge_pair(pa, pb, &mesh.verts, opts.enabled);
-            let cost = vol - (pa.volume + pb.volume);
+            let cost = if opts.weighted_cost {
+                wvol - (pa.weighted_volume + pb.weighted_volume)
+            } else {
+                vol - (pa.volume + pb.volume)
+            };
             if cost > opts.volume_threshold {
                 return None;
             }
@@ -827,14 +852,13 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                 // the empty-space check rejects almost all of them. With
                 // many live components that's >100M rejections worth of
                 // BVH queries. Accept the current count instead.
-                if opts.empty_space.is_some() {
-                    eprintln!(
-                        "topology PQ drained at {} primitives; skipping all-pairs (--empty-space active)",
-                        alive_count
-                    );
-                    break;
-                }
                 let pushed = if let Some((r_frac, k, angle_rad)) = opts.proximity {
+                    // Proximity is spatially bounded (O(N·k) candidates,
+                    // not O(N²)). Safe to run even when --empty-space is
+                    // on — the empty-space hard reject still fires on
+                    // every pop and rejects any candidate that bridges
+                    // open volume. We only skip the brute all-pairs
+                    // fallback in empty-space mode.
                     let max_dist = r_frac * mesh_diag;
                     let p = push_proximity_pairs(
                         &prims,
@@ -845,12 +869,21 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                         max_dist,
                         k,
                         angle_rad,
+                        opts.weighted_cost,
                     );
                     eprintln!(
                         "topology PQ drained at {} primitives; pushed {} proximity candidates (k={}, r={:.3}, angle<={:.0}°)",
                         alive_count, p, k, max_dist, angle_rad.to_degrees(),
                     );
                     p
+                } else if opts.empty_space.is_some() {
+                    // Brute all-pairs would generate O(N²) candidates
+                    // that the empty-space check rejects almost all of.
+                    eprintln!(
+                        "topology PQ drained at {} primitives; skipping brute all-pairs (--empty-space active, no --proximity)",
+                        alive_count
+                    );
+                    break;
                 } else {
                     let p = push_all_pairs(
                         &prims,
@@ -858,6 +891,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                         &mut pq,
                         opts.volume_threshold,
                         opts.enabled,
+                        opts.weighted_cost,
                     );
                     eprintln!(
                         "topology PQ drained at {} primitives; pushed {} all-pairs candidates",
@@ -1100,7 +1134,11 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
             let pn = &prims[n as usize];
             let (_q, prim_fit, vol, wvol, _vidx) =
                 merge_pair(pa, pn, &mesh.verts, opts.enabled);
-            let cost = vol - (pa.volume + pn.volume);
+            let cost = if opts.weighted_cost {
+                wvol - (pa.weighted_volume + pn.weighted_volume)
+            } else {
+                vol - (pa.volume + pn.volume)
+            };
             if cost > opts.volume_threshold {
                 continue;
             }

@@ -307,12 +307,17 @@ fn fit_capsule_on_axis(center: Point3<f32>, axis: Vector3<f32>, points: &[Point3
     }
     let r = max_r2.sqrt().max(MIN_HALF_EXTENT);
 
-    // Second pass: paper §3.2 — h(p) = a·(p-c) - sqrt(r² - r(p)²) is one
-    // signed value per point; height = max h(p) - min h(p) gives the gap
-    // between the two hemisphere centers. The +-extreme point dominates the
-    // max (since its `s ≈ r` makes ax-s close to ax+ - r), and the --extreme
-    // dominates the min, so this correctly places both hemispheres while
-    // letting interior points sit in the cylindrical body.
+    // Second pass: place the two hemisphere centres so every point is
+    // contained in either the cylinder body or one of the spheres.
+    //
+    // For point (ax, r_p) with s = √(r² − r_p²), the upper hemisphere
+    // centre `top` must satisfy `top ≥ ax − s` (so the upper sphere
+    // reaches up to `ax`), and the lower hemisphere centre `bot` must
+    // satisfy `bot ≤ ax + s`. Taking max/min over points respectively
+    // gives the tightest valid (top, bot). NB: the paper's formula
+    // `h(p) = ax − s` with `height = max(h) − min(h)` is over-conservative —
+    // it conflates the two constraints and yields a longer-than-needed
+    // capsule.
     let mut top = f32::NEG_INFINITY;
     let mut bot = f32::INFINITY;
     for p in points {
@@ -322,14 +327,24 @@ fn fit_capsule_on_axis(center: Point3<f32>, axis: Vector3<f32>, points: &[Point3
         let r2_p = radial.norm_squared();
         let inner = (r * r - r2_p).max(0.0);
         let s = inner.sqrt();
-        let h_p = ax - s;
-        if h_p > top {
-            top = h_p;
+        let upper_lower_bound = ax - s; // top must be at least this
+        let lower_upper_bound = ax + s; // bot must be at most this
+        if upper_lower_bound > top {
+            top = upper_lower_bound;
         }
-        if h_p < bot {
-            bot = h_p;
+        if lower_upper_bound < bot {
+            bot = lower_upper_bound;
         }
     }
+    // top can come out below bot if all points fit inside a single sphere
+    // (all axial extremes covered by hemispheres alone). In that case we
+    // collapse to a degenerate cylinder body of length zero.
+    let (top, bot) = if top < bot {
+        let mid = (top + bot) * 0.5;
+        (mid, mid)
+    } else {
+        (top, bot)
+    };
     let h = (top - bot).max(MIN_HALF_EXTENT);
     let shift = (top + bot) * 0.5;
     let recentered = center + axis * shift;
@@ -734,74 +749,75 @@ pub fn fit_all(
     out
 }
 
-/// Try every primitive type and return the one with the smallest weighted
-/// volume.
+/// Try every enabled primitive type and return the one with the smallest
+/// weighted volume. OBB is computed unconditionally because its centre
+/// seeds the sphere / cylinder / capsule fits, but it's only *eligible*
+/// to be returned when `enabled.obb == true`.
 pub fn fit_best(
     axes: [Vector3<f32>; 3],
     points: &[Point3<f32>],
     enabled: PrimMask,
 ) -> Prim {
-    // OBB is always cheap and used as the seed center for sphere/cyl/cap.
     let obb = fit_obb(axes, points);
     let obb_center = match &obb {
         Prim::Obb { center, .. } => *center,
         _ => unreachable!(),
     };
-    let mut best = obb.clone();
 
-    // Tiny primitives (a single triangle, an edge merge of two coplanar
-    // triangles) don't carry enough geometry for cylinder / capsule /
-    // frustum / prism to beat the OBB — their fits collapse to the same
-    // box-shaped slab. Skip the per-call cost.
-    const FANCY_FIT_MIN_VERTS: usize = 8;
-    if points.len() < FANCY_FIT_MIN_VERTS {
-        return best;
-    }
     let cylinder = if enabled.cylinder || enabled.frustum {
         Some(fit_cylinder_best(obb_center, axes, points))
     } else {
         None
     };
-    // A sphere centered on the OBB center has radius ≥ √(hx²+hy²+hz²)
-    // (must reach the OBB corner), giving volume ≥ (4π√3 / 8) × OBB ≈
-    // 2.7× OBB. With both at weight 1.0 the sphere can never beat the
-    // OBB, so when OBB is also a candidate we skip the per-call cost.
-    if enabled.sphere && !enabled.obb {
-        let cand = fit_sphere(obb_center, points);
-        if cand.weighted_volume() < best.weighted_volume() {
-            best = cand;
-        }
-    }
-    if enabled.cylinder {
-        if let Some(c) = &cylinder {
-            if c.weighted_volume() < best.weighted_volume() {
-                best = c.clone();
+
+    let mut best: Option<Prim> = None;
+    let consider = |cand: Prim, best: &mut Option<Prim>| match best {
+        None => *best = Some(cand),
+        Some(b) => {
+            if cand.weighted_volume() < b.weighted_volume() {
+                *best = Some(cand);
             }
         }
+    };
+
+    if enabled.obb {
+        consider(obb.clone(), &mut best);
     }
-    if enabled.capsule {
-        let cand = fit_capsule_best(obb_center, axes, points);
-        if cand.weighted_volume() < best.weighted_volume() {
-            best = cand;
+
+    // Tiny primitives (singleton tri, two coplanar tris) don't have
+    // enough geometry for cylinder/capsule/frustum/prism to beat OBB —
+    // they collapse to the same box-shaped slab. Skip the per-call cost.
+    const FANCY_FIT_MIN_VERTS: usize = 8;
+    if points.len() >= FANCY_FIT_MIN_VERTS {
+        // Sphere strictly loses to OBB on weighted volume (proof: r ≥
+        // √(hx²+hy²+hz²) gives sphere ≥ 2.7× OBB). Only worth fitting
+        // when OBB itself isn't a candidate.
+        if enabled.sphere && !enabled.obb {
+            consider(fit_sphere(obb_center, points), &mut best);
+        }
+        if enabled.cylinder {
+            if let Some(c) = &cylinder {
+                consider(c.clone(), &mut best);
+            }
+        }
+        if enabled.capsule {
+            consider(fit_capsule_best(obb_center, axes, points), &mut best);
+        }
+        if enabled.frustum {
+            let cyl_axis = match cylinder.as_ref() {
+                Some(Prim::Cylinder { axis, .. }) => *axis,
+                _ => axes[0],
+            };
+            consider(fit_frustum(obb_center, cyl_axis, points), &mut best);
+        }
+        if enabled.prism {
+            consider(fit_prism_best(obb_center, axes, points), &mut best);
         }
     }
-    if enabled.frustum {
-        let cyl_axis = match cylinder.as_ref().unwrap() {
-            Prim::Cylinder { axis, .. } => *axis,
-            _ => unreachable!(),
-        };
-        let cand = fit_frustum(obb_center, cyl_axis, points);
-        if cand.weighted_volume() < best.weighted_volume() {
-            best = cand;
-        }
-    }
-    if enabled.prism {
-        let cand = fit_prism_best(obb_center, axes, points);
-        if cand.weighted_volume() < best.weighted_volume() {
-            best = cand;
-        }
-    }
-    best
+
+    // Pathological: every type masked off. Return the OBB so we always
+    // emit something.
+    best.unwrap_or(obb)
 }
 
 #[derive(Clone, Copy, Debug)]

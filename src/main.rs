@@ -26,6 +26,7 @@ struct CliArgs {
     quality_beta: f32,
     shell_aware: bool,
     proximity: Option<(f32, usize, f32)>, // (max_dist_frac, k, max_angle_rad)
+    weighted_cost: bool,
     metrics: bool,
     metrics_json: Option<PathBuf>,
 }
@@ -42,6 +43,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut quality_beta: f32 = 0.0;
     let mut shell_aware = false;
     let mut proximity: Option<(f32, usize, f32)> = None;
+    let mut weighted_cost = false;
     let mut metrics_flag = false;
     let mut metrics_json: Option<PathBuf> = None;
     let mut positional: Vec<String> = Vec::new();
@@ -81,6 +83,10 @@ fn parse_args() -> Result<CliArgs> {
             "--shell" => {
                 args.remove(0);
                 shell_aware = true;
+            }
+            "--weighted-cost" => {
+                args.remove(0);
+                weighted_cost = true;
             }
             "--proximity" => {
                 args.remove(0);
@@ -189,6 +195,7 @@ fn parse_args() -> Result<CliArgs> {
         quality_beta,
         shell_aware,
         proximity,
+        weighted_cost,
         metrics: metrics_flag,
         metrics_json,
     })
@@ -209,6 +216,11 @@ fn print_usage() {
                             ambient-occlusion exposure; weights Q and PCA by
                             it so interior geometry doesn't bias axes. Best
                             for kitbashed / scanned assets.
+       [--weighted-cost]    PQ ordering uses weighted volume (cost = ΔwV).
+                            Trades surface fit for runtime/memory cost.
+                            Helps near-convex / organic meshes (rocks,
+                            terrain) by 10-20% Hausdorff. Hurts detail-
+                            heavy meshes (vehicles) by similar amounts.
        [--proximity]        spatial-proximity merges between disconnected
                             components. Adds candidate edges between nearby
                             components in the initial PQ, with cost ordering
@@ -308,6 +320,7 @@ fn main() -> Result<()> {
             quality_beta: args.quality_beta,
             shell_aware: args.shell_aware,
             proximity: args.proximity,
+            weighted_cost: args.weighted_cost,
         },
     );
     let merge_ms = t2.elapsed().as_secs_f64() * 1000.0;

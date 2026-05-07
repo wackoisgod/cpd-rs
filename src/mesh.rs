@@ -452,6 +452,56 @@ pub struct SharpEdges {
     pub per_face: Vec<Vec<Vector3<f32>>>,
 }
 
+/// Compute a per-mesh adaptive dihedral threshold for sharp-edge
+/// detection. The fixed 30° cutoff catches too many small ridges on
+/// organic meshes (rocks, terrain) where most dihedrals are tiny; the
+/// 95th percentile of the actual dihedral distribution is mesh-aware
+/// without needing user tuning. Clamped to [30°, 60°] to keep behaviour
+/// in a sane range.
+pub fn adaptive_sharp_threshold(mesh: &Mesh) -> f32 {
+    let face_normals: Vec<Vector3<f32>> = mesh
+        .tris
+        .iter()
+        .map(|t| {
+            let a = mesh.verts[t[0] as usize];
+            let b = mesh.verts[t[1] as usize];
+            let c = mesh.verts[t[2] as usize];
+            let n = (b - a).cross(&(c - a));
+            if n.norm_squared() > 1e-20 {
+                n.normalize()
+            } else {
+                Vector3::new(0.0, 1.0, 0.0)
+            }
+        })
+        .collect();
+
+    let mut edge_to_faces: HashMap<(u32, u32), Vec<u32>> = HashMap::new();
+    for (fi, t) in mesh.tris.iter().enumerate() {
+        for e in [(t[0], t[1]), (t[1], t[2]), (t[2], t[0])] {
+            let key = if e.0 < e.1 { (e.0, e.1) } else { (e.1, e.0) };
+            edge_to_faces.entry(key).or_default().push(fi as u32);
+        }
+    }
+    let mut angles: Vec<f32> = Vec::new();
+    for faces in edge_to_faces.values() {
+        if faces.len() != 2 {
+            continue;
+        }
+        let dot = face_normals[faces[0] as usize]
+            .dot(&face_normals[faces[1] as usize])
+            .clamp(-1.0, 1.0);
+        angles.push(dot.acos());
+    }
+    if angles.is_empty() {
+        return std::f32::consts::FRAC_PI_6;
+    }
+    angles.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let p95 = angles[(angles.len() * 95) / 100];
+    let min_t = std::f32::consts::FRAC_PI_6; // 30°
+    let max_t = std::f32::consts::FRAC_PI_3; // 60°
+    p95.clamp(min_t, max_t)
+}
+
 pub fn build_sharp_edges(
     mesh: &Mesh,
     dihedral_threshold_rad: f32,

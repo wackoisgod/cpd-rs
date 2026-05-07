@@ -47,6 +47,7 @@ cpd <mesh.glb> <target_n> [out.obj]
     [--quality <beta>]             experimental Hausdorff-aware refit
     [--shell]                      experimental shell-aware orientation
     [--proximity]                  spatial-proximity replaces all-pairs fallback
+    [--weighted-cost]              PQ ordering uses weighted volume (organic-friendly)
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
         [--empty-space-distance <frac-of-diag>]   default 0.01
@@ -135,6 +136,34 @@ handles images (including agentic tooling).
   at N=128 (4.26% → 3.74% Hausdorff) but can *worsen* at N=256 because
   greedy refit decisions don't always reduce the global max-Hausdorff.
   Try `--quality 1` to `--quality 5`; default `0` (off).
+
+- **Weighted merge cost (`--weighted-cost`).** Default cost for the
+  priority queue is `ΔV` (excess unweighted volume). With this flag,
+  cost becomes `ΔweightedV` — every merge candidate is judged using
+  the per-shape weights (OBB/sphere/capsule = 1.0, cylinder = 1.05,
+  prism = 1.4, frustum = 2.1). This is the runtime/memory-cost ranking
+  the paper's weights are designed to express, but it shifts the
+  selection pressure away from prism / frustum primitives that often
+  catch corner outliers in detail-heavy meshes.
+
+  Measured impact on the rock kit (1 component, near-convex):
+
+  | N    | default | --weighted-cost |
+  | ---- | ------- | --------------- |
+  | 64   | 6.39%   | **5.68%** (-11%)|
+  | 128  | 4.26%   | **3.93%** (-8%) |
+  | 256  | 2.56%   | **2.05%** (-20%)|
+
+  But on detail-heavy meshes the effect reverses (blink N=128: 5.04%
+  → 6.72%; ram-visual N=256: 7.74% → 8.54%). Default off; turn on
+  for organic / near-convex inputs (rocks, terrain, sculpted props).
+
+- **Adaptive sharp-edge threshold.** Replaces the fixed 30° dihedral
+  threshold for sharp-edge feature detection with a per-mesh value:
+  the 95th percentile of the actual dihedral distribution, clamped to
+  [30°, 60°]. Prevents over-flagging tiny ridges on organic meshes
+  (rocks at 43°) while leaving angular meshes near the cap (vehicles
+  at 60°).
 
 - **Spatial-proximity merges (`--proximity`).** Replaces the all-pairs
   fallback (paper §3.4) with a spatially-filtered version: when the
