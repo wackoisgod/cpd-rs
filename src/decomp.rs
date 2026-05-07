@@ -510,15 +510,36 @@ fn merge_pair(
     b: &Primitive,
     mesh_verts: &[Point3<f32>],
     enabled: PrimMask,
+    axis_override: Option<&[Vector3<f32>; 3]>,
 ) -> (Matrix3<f32>, Prim, f32, f32, Vec<u32>) {
     let q = a.q + b.q;
-    let axes = axes_from_q(q);
+    let axes = match axis_override {
+        Some(a) => *a,
+        None => axes_from_q(q),
+    };
     let vidx = merge_sorted_unique(&a.vertex_indices, &b.vertex_indices);
     let pts = gather(mesh_verts, &vidx);
     let prim_fit = prim::fit_best(axes, &pts, enabled);
     let vol = prim_fit.volume();
     let wvol = prim_fit.weighted_volume();
     (q, prim_fit, vol, wvol, vidx)
+}
+
+/// Mesh-dominant orientation: eigendecomposition of the area-weighted
+/// outer product of face normals summed over the entire mesh, with no
+/// tangent term (we want the orientation determined by where the surface
+/// faces, not by ad-hoc tangent stabilisation). For architectural meshes
+/// this typically returns world-aligned axes. Used as a global
+/// orientation override when `--axis-align` is on.
+fn compute_dominant_axes(mesh: &Mesh) -> [Vector3<f32>; 3] {
+    let mut q = Matrix3::zeros();
+    for t in &mesh.tris {
+        let p0 = mesh.verts[t[0] as usize];
+        let p1 = mesh.verts[t[1] as usize];
+        let p2 = mesh.verts[t[2] as usize];
+        q += face_quadric(p0, p1, p2, 0.0);
+    }
+    axes_from_q(q)
 }
 
 fn live_indices(prims: &[Primitive]) -> Vec<u32> {
@@ -596,6 +617,7 @@ fn push_proximity_pairs(
     max_angle_rad: f32,
     weighted_cost: bool,
     reject_pancakes: bool,
+    axis_override: Option<[Vector3<f32>; 3]>,
 ) -> usize {
     let live = live_indices(prims);
     if live.len() < 2 {
@@ -636,7 +658,7 @@ fn push_proximity_pairs(
             let pa = &prims[a as usize];
             let pb = &prims[b as usize];
             let (_q, prim_fit, vol, wvol, _vidx) =
-                merge_pair(pa, pb, mesh_verts, enabled);
+                merge_pair(pa, pb, mesh_verts, enabled, axis_override.as_ref());
             let mut cost = if weighted_cost {
                 wvol - (pa.weighted_volume + pb.weighted_volume)
             } else {
@@ -678,6 +700,7 @@ fn push_all_pairs(
     enabled: PrimMask,
     weighted_cost: bool,
     reject_pancakes: bool,
+    axis_override: Option<[Vector3<f32>; 3]>,
 ) -> usize {
     let live = live_indices(prims);
     let mut pairs: Vec<(u32, u32)> = Vec::new();
@@ -696,7 +719,7 @@ fn push_all_pairs(
         .filter_map(|&(a, b)| {
             let pa = &prims[a as usize];
             let pb = &prims[b as usize];
-            let (_q, prim_fit, vol, wvol, _vidx) = merge_pair(pa, pb, mesh_verts, enabled);
+            let (_q, prim_fit, vol, wvol, _vidx) = merge_pair(pa, pb, mesh_verts, enabled, axis_override.as_ref());
             let mut cost = if weighted_cost {
                 wvol - (pa.weighted_volume + pb.weighted_volume)
             } else {
@@ -849,6 +872,23 @@ pub struct DecompOpts {
     /// stacking on hollow architectural meshes that strict
     /// `cull_redundant` (full vertex containment) misses. Try 0.85–0.95.
     pub cull_overlap: Option<f32>,
+    /// Lock all primitive orientations to the mesh's dominant
+    /// orientation (eigendecomposition of the area-weighted face-normal
+    /// outer-product summed over the entire mesh). Targets the
+    /// rotated-slab failure mode on architectural meshes: the building's
+    /// rooftop OBB picks an arbitrary in-plane orientation from
+    /// near-rank-1 Q, which can be 30°-60° off from world axes and
+    /// introduces drift past the silhouette. Locking to the global
+    /// dominant axes (typically world-axis-aligned for game-art
+    /// architecture) eliminates that pathology — at the cost of
+    /// preventing per-primitive orientation refinement that helps on
+    /// rotated organic regions. Default off.
+    pub axis_align: bool,
+    /// World-axis lock: like axis_align but forces (1,0,0)/(0,1,0)/(0,0,1)
+    /// regardless of mesh orientation. For game architecture authored in
+    /// world space (the common case) this is what users actually want —
+    /// avoids picking up small ambient rotations from the source mesh.
+    pub world_axis_align: bool,
     /// Per-face quadric's tangent-term coefficient (paper §3.4 "Coplanar
     /// Vertices", value `ε`). Default 0.01 stabilises the eigendecomp on
     /// coplanar regions. Setting to 0 makes Q rank-1, leaving in-plane
@@ -923,6 +963,27 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
     };
     let mesh_diag = crate::mesh::aabb_diag(&mesh.verts).max(1e-6);
 
+    let dominant_axes: Option<[Vector3<f32>; 3]> = if opts.world_axis_align {
+        let axes = [
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        ];
+        eprintln!("world-axis-align: locked to (1,0,0)/(0,1,0)/(0,0,1)");
+        Some(axes)
+    } else if opts.axis_align {
+        let axes = compute_dominant_axes(mesh);
+        eprintln!(
+            "axis-align: locked to mesh-dominant axes [{:.3},{:.3},{:.3}], [{:.3},{:.3},{:.3}], [{:.3},{:.3},{:.3}]",
+            axes[0].x, axes[0].y, axes[0].z,
+            axes[1].x, axes[1].y, axes[1].z,
+            axes[2].x, axes[2].y, axes[2].z,
+        );
+        Some(axes)
+    } else {
+        None
+    };
+
     let face_exposure: Option<Vec<f32>> = if opts.shell_aware {
         let bvh_ref = bvh.as_ref().expect("bvh built when shell_aware");
         let exp = crate::mesh::compute_face_exposure(mesh, bvh_ref, 32);
@@ -961,7 +1022,10 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
             Some(exp) => q_unit * exp[fi],
             None => q_unit,
         };
-        let axes = axes_from_q(q);
+        let axes = match &dominant_axes {
+            Some(a) => *a,
+            None => axes_from_q(q),
+        };
         let mut vidx = [tri[0], tri[1], tri[2]];
         vidx.sort();
         let pts = [p0, p1, p2];
@@ -1029,7 +1093,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
             let pa = &prims[f as usize];
             let pb = &prims[n as usize];
             let (_q, prim_fit, vol, wvol, _vidx) =
-                merge_pair(pa, pb, &mesh.verts, opts.enabled);
+                merge_pair(pa, pb, &mesh.verts, opts.enabled, dominant_axes.as_ref());
             let mut cost = if opts.weighted_cost {
                 wvol - (pa.weighted_volume + pb.weighted_volume)
             } else {
@@ -1101,6 +1165,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                         angle_rad,
                         opts.weighted_cost,
                         opts.reject_pancakes,
+                        dominant_axes,
                     );
                     eprintln!(
                         "topology PQ drained at {} primitives; pushed {} proximity candidates (k={}, r={:.3}, angle<={:.0}°)",
@@ -1124,6 +1189,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                         opts.enabled,
                         opts.weighted_cost,
                         opts.reject_pancakes,
+                        dominant_axes,
                     );
                     eprintln!(
                         "topology PQ drained at {} primitives; pushed {} all-pairs candidates",
@@ -1254,16 +1320,24 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                 }
             };
 
-            // Candidate 1: vertex PCA (shell-only when shell-aware is on).
-            try_axes(pca_axes(&pts_orient), &mut best_prim, &mut best_score);
-            // Candidate 2: tangent-plane PCA (shell-only when on).
-            try_axes(tangent_plane_pca_axes(new_q, &pts_orient), &mut best_prim, &mut best_score);
-            // Candidate 3: sharp-edge directions.
-            if let Some(sharp_ref) = &sharp_edges {
-                let face_iter = walk_faces(a as u32, prims[a].face_count, &face_next)
-                    .chain(walk_faces(b as u32, prims[b].face_count, &face_next));
-                if let Some(axes) = sharp_edge_axes(sharp_ref, face_iter) {
-                    try_axes(axes, &mut best_prim, &mut best_score);
+            if let Some(da) = &dominant_axes {
+                // Axis-align mode: only the locked dominant axes are
+                // considered for refit. PCA / tangent-plane / sharp-edge
+                // candidates would re-introduce per-primitive rotated
+                // orientations the user explicitly asked us to avoid.
+                try_axes(*da, &mut best_prim, &mut best_score);
+            } else {
+                // Candidate 1: vertex PCA (shell-only when shell-aware is on).
+                try_axes(pca_axes(&pts_orient), &mut best_prim, &mut best_score);
+                // Candidate 2: tangent-plane PCA (shell-only when on).
+                try_axes(tangent_plane_pca_axes(new_q, &pts_orient), &mut best_prim, &mut best_score);
+                // Candidate 3: sharp-edge directions.
+                if let Some(sharp_ref) = &sharp_edges {
+                    let face_iter = walk_faces(a as u32, prims[a].face_count, &face_next)
+                        .chain(walk_faces(b as u32, prims[b].face_count, &face_next));
+                    if let Some(axes) = sharp_edge_axes(sharp_ref, face_iter) {
+                        try_axes(axes, &mut best_prim, &mut best_score);
+                    }
                 }
             }
 
@@ -1382,7 +1456,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         for &n in &candidates {
             let pn = &prims[n as usize];
             let (_q, prim_fit, vol, wvol, _vidx) =
-                merge_pair(pa, pn, &mesh.verts, opts.enabled);
+                merge_pair(pa, pn, &mesh.verts, opts.enabled, dominant_axes.as_ref());
             let mut cost = if opts.weighted_cost {
                 wvol - (pa.weighted_volume + pn.weighted_volume)
             } else {
@@ -1424,6 +1498,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                 opts.enabled,
                 max_passes,
                 opts.tangent_eps,
+                dominant_axes.as_ref(),
             );
             eprintln!(
                 "rebalance: {} total face moves in {:.1} ms",
@@ -1459,6 +1534,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
             threshold_frac,
             max_splits,
             opts.tangent_eps,
+            dominant_axes.as_ref(),
         );
         eprintln!(
             "split-worst: {} primitives split in {:.1} ms",
@@ -1508,6 +1584,7 @@ fn refit_from_faces(
     enabled: PrimMask,
     bvh: &Bvh,
     tangent_eps: f32,
+    axis_override: Option<&[Vector3<f32>; 3]>,
 ) -> RebalanceState {
     // Sum per-face quadrics, gather subsumed vertices.
     let mut q = Matrix3::zeros();
@@ -1525,7 +1602,10 @@ fn refit_from_faces(
     let mut vidx: Vec<u32> = vidx_set.into_iter().collect();
     vidx.sort();
     let pts: Vec<Point3<f32>> = vidx.iter().map(|&i| mesh.verts[i as usize]).collect();
-    let axes = axes_from_q(q);
+    let axes = match axis_override {
+        Some(a) => *a,
+        None => axes_from_q(q),
+    };
     let prim_fit = prim::fit_best(axes, &pts, enabled);
     let h = local_hausdorff(&prim_fit, bvh, mesh);
     RebalanceState {
@@ -1554,6 +1634,7 @@ fn rebalance_faces(
     enabled: PrimMask,
     max_passes: usize,
     tangent_eps: f32,
+    axis_override: Option<&[Vector3<f32>; 3]>,
 ) -> usize {
     // Combined cost so we don't accept moves that improve Hausdorff at
     // catastrophic volume cost. Same shape as --quality.
@@ -1593,7 +1674,7 @@ fn rebalance_faces(
     // to be tracked (the greedy pass had its own per-primitive state, but
     // for migration we want a single source of truth).
     let mut state: Vec<RebalanceState> = (0..n_prims)
-        .map(|pid| refit_from_faces(&prim_faces[pid], mesh, enabled, bvh, tangent_eps))
+        .map(|pid| refit_from_faces(&prim_faces[pid], mesh, enabled, bvh, tangent_eps, axis_override))
         .collect();
 
     let mut total_moves = 0usize;
@@ -1637,8 +1718,8 @@ fn rebalance_faces(
                 let mut new_b_faces = prim_faces[cand_p].clone();
                 new_b_faces.push(f as u32);
 
-                let new_a = refit_from_faces(&new_a_faces, mesh, enabled, bvh, tangent_eps);
-                let new_b = refit_from_faces(&new_b_faces, mesh, enabled, bvh, tangent_eps);
+                let new_a = refit_from_faces(&new_a_faces, mesh, enabled, bvh, tangent_eps, axis_override);
+                let new_b = refit_from_faces(&new_b_faces, mesh, enabled, bvh, tangent_eps, axis_override);
                 let new_combined = score_state(&new_a) + score_state(&new_b);
                 let delta = new_combined - old_combined;
                 if delta < best_delta {
@@ -1757,6 +1838,7 @@ fn split_worst_primitives(
     threshold_frac: f32,
     max_splits: usize,
     tangent_eps: f32,
+    axis_override: Option<&[Vector3<f32>; 3]>,
 ) -> usize {
     let mesh_diag = crate::mesh::aabb_diag(&mesh.verts).max(1e-6);
     let threshold = threshold_frac * mesh_diag;
@@ -1791,7 +1873,7 @@ fn split_worst_primitives(
     // cost on the few worst primitives than split the wrong ones.
     let mut state: Vec<RebalanceState> = (0..n_prims)
         .map(|pid| {
-            let mut s = refit_from_faces(&prim_faces[pid], mesh, enabled, bvh, tangent_eps);
+            let mut s = refit_from_faces(&prim_faces[pid], mesh, enabled, bvh, tangent_eps, axis_override);
             s.hausdorff = local_hausdorff_dense(&s.prim, bvh, mesh);
             s
         })
@@ -1866,8 +1948,8 @@ fn split_worst_primitives(
             if faces_a.is_empty() || faces_b.is_empty() {
                 continue;
             }
-            let mut new_a = refit_from_faces(&faces_a, mesh, enabled, bvh, tangent_eps);
-            let mut new_b = refit_from_faces(&faces_b, mesh, enabled, bvh, tangent_eps);
+            let mut new_a = refit_from_faces(&faces_a, mesh, enabled, bvh, tangent_eps, axis_override);
+            let mut new_b = refit_from_faces(&faces_b, mesh, enabled, bvh, tangent_eps, axis_override);
             new_a.hausdorff = local_hausdorff_dense(&new_a.prim, bvh, mesh);
             new_b.hausdorff = local_hausdorff_dense(&new_b.prim, bvh, mesh);
             let new_max_h = new_a.hausdorff.max(new_b.hausdorff);

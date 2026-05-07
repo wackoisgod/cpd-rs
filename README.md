@@ -68,6 +68,11 @@ cpd <mesh.glb> <target_n> [out.obj]
                                    another primitive B (with A.vol ≤ B.vol).
                                    Largely a no-op on hollow architecture
                                    (true overlap is rare) — see section.
+    [--axis-align]                 experimental: lock primitive orientations
+                                   to mesh-dominant axes. Hurts more meshes
+                                   than it helps — see section.
+    [--world-axis]                 experimental: lock to (1,0,0)/(0,1,0)/
+                                   (0,0,1). Same caveats as --axis-align.
     [--no-tangent-eps]             disable Q's ε·ttᵀ in-plane bias (architecture)
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
@@ -132,6 +137,7 @@ handles images (including agentic tooling).
 | ext. | Merge-time feasibility check (rejects slab merges, paper §3.3 unsolved) | ✓ |
 | ext. | Post-merge split-worst pass (experimental, mixed results) | ✓ |
 | ext. | Partial-overlap cull (experimental — no-op on hollow architecture) | ✓ |
+| ext. | Axis-aligned OBB constraint (experimental — usually regresses) | ✓ |
 
 ### Extensions beyond the paper
 
@@ -186,6 +192,50 @@ handles images (including agentic tooling).
   Kept as an option for the rare case where it might help (highly
   redundant initial decompositions, post-rebalance state). Default off.
   Don't expect Hausdorff or coverage gains on hollow architecture.
+
+- **Axis-aligned OBB constraint (experimental, `--axis-align` /
+  `--world-axis`).** Locks all primitive orientations to either the
+  mesh's dominant axes (eigendecomposition of global Q) or pure world
+  axes. Motivated by the rotated-slab failure mode and Park & Sung
+  2024's box-fitting work, with the hypothesis that constraining
+  orientation would eliminate per-primitive rotation pathologies on
+  architectural meshes.
+
+  **Usually regresses.** Tested on every available mesh:
+
+  | mesh / N            | default | --axis-align | Δ           |
+  | ------------------- | ------- | ------------ | ----------- |
+  | rock 128            | 4.26%   | 6.91%        | +2.6pp ❌  |
+  | blink 128           | 6.16%   | 7.23%        | +1.1pp ❌  |
+  | dojo 483            | 8.69%   | 9.66%        | +1.0pp ❌  |
+  | building 128        | 23.60%  | 20.70%       | -2.9pp ✓   |
+  | building 800        | 11.24%  | 20.70%       | +9.5pp ❌  |
+  | cardboard 44        | 4.87%   | 4.87%        | identical   |
+
+  The intuition was wrong. Forcing axes inflates primitive volumes
+  (PCA-rotated bounding rectangles can be much smaller than world-
+  axis-aligned ones for any feature with non-trivial rotation). It
+  helps marginally on building at low N because the merge is so
+  starved that no orientation works well anyway, but every mesh with
+  budget room has natural rotations the algorithm should be free to
+  find.
+
+  The original "rotated slab" failure was a specific Q-eigenvector
+  pathology when ε·ttᵀ rotated near-rank-1 Q. `--no-tangent-eps` and
+  `--feasibility 0.15` already address that without losing per-primitive
+  rotation freedom.
+
+  Confirms the structural conclusion: the ~11% Hausdorff floor on
+  hard architecture is a basic-primitive geometric limit
+  (rectangular OBB cannot fit non-rectangular planar region), not a
+  missing algorithmic feature. Locking orientation does not break
+  through it.
+
+  Default off. Kept as experimental like `--rebalance` and
+  `--split-worst` for reproducibility and as scaffolding (the
+  `compute_dominant_axes` / `axis_override` plumbing could feed a
+  more nuanced future approach, e.g. local-axis lock keyed off
+  per-primitive Q rank).
 
 - **Hausdorff-aware refit (experimental, `--quality <beta>`).** When `beta
   > 0` the post-merge refit ranks candidates by

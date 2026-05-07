@@ -33,6 +33,8 @@ struct CliArgs {
     feasibility: Option<f32>,
     split_worst: Option<(f32, usize)>,
     cull_overlap: Option<f32>,
+    axis_align: bool,
+    world_axis_align: bool,
     tangent_eps: f32,
     metrics: bool,
     metrics_json: Option<PathBuf>,
@@ -57,6 +59,8 @@ fn parse_args() -> Result<CliArgs> {
     let mut feasibility: Option<f32> = None;
     let mut split_worst: Option<(f32, usize)> = None;
     let mut cull_overlap: Option<f32> = None;
+    let mut axis_align = false;
+    let mut world_axis_align = false;
     let mut tangent_eps: f32 = 0.01; // paper §3.4 default
     let mut metrics_flag = false;
     let mut metrics_json: Option<PathBuf> = None;
@@ -165,6 +169,14 @@ fn parse_args() -> Result<CliArgs> {
                 args.remove(0);
                 let f: f32 = v.parse().context("not a float")?;
                 cull_overlap = Some(f);
+            }
+            "--axis-align" => {
+                args.remove(0);
+                axis_align = true;
+            }
+            "--world-axis" => {
+                args.remove(0);
+                world_axis_align = true;
             }
             "--no-tangent-eps" => {
                 args.remove(0);
@@ -296,6 +308,8 @@ fn parse_args() -> Result<CliArgs> {
         feasibility,
         split_worst,
         cull_overlap,
+        axis_align,
+        world_axis_align,
         tangent_eps,
         metrics: metrics_flag,
         metrics_json,
@@ -351,6 +365,12 @@ fn print_usage() {
                             split adds 1 primitive. Targets the OBB-on-
                             non-rectangular-region limit.
            [--split-worst-max <int>]  cap on splits (default 32)
+       [--axis-align]       lock all primitive orientations to the mesh's
+                            dominant axes (eigendecomposition of global Q).
+                            Eliminates the rotated-slab failure mode on
+                            architecture; off-by-default since it removes
+                            per-primitive orientation refinement that helps
+                            organic / vehicle / rotated meshes.
        [--no-tangent-eps]   set Q's tangent-term coefficient to 0 (paper
                             §3.4 says decided-per-mesh). Removes the
                             rotated-OBB failure mode on large flat regions;
@@ -463,6 +483,8 @@ fn main() -> Result<()> {
             feasibility: args.feasibility,
             split_worst: args.split_worst,
             cull_overlap: args.cull_overlap,
+            axis_align: args.axis_align,
+            world_axis_align: args.world_axis_align,
             tangent_eps: args.tangent_eps,
         },
     );
