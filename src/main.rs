@@ -31,6 +31,7 @@ struct CliArgs {
     reject_pancakes: bool,
     strip_thin_obbs: Option<f32>,
     feasibility: Option<f32>,
+    split_worst: Option<(f32, usize)>,
     tangent_eps: f32,
     metrics: bool,
     metrics_json: Option<PathBuf>,
@@ -53,6 +54,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut reject_pancakes = false;
     let mut strip_thin_obbs: Option<f32> = None;
     let mut feasibility: Option<f32> = None;
+    let mut split_worst: Option<(f32, usize)> = None;
     let mut tangent_eps: f32 = 0.01; // paper §3.4 default
     let mut metrics_flag = false;
     let mut metrics_json: Option<PathBuf> = None;
@@ -129,6 +131,28 @@ fn parse_args() -> Result<CliArgs> {
                 args.remove(0);
                 let f: f32 = v.parse().context("not a float")?;
                 feasibility = Some(f);
+            }
+            "--split-worst" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--split-worst needs a threshold-frac-of-diag value")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                let prev_max = split_worst.map(|(_, m)| m).unwrap_or(32);
+                split_worst = Some((f, prev_max));
+            }
+            "--split-worst-max" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--split-worst-max needs an integer")?;
+                args.remove(0);
+                let m: usize = v.parse().context("not an integer")?;
+                let prev_frac = split_worst.map(|(f, _)| f).unwrap_or(0.05);
+                split_worst = Some((prev_frac, m));
             }
             "--no-tangent-eps" => {
                 args.remove(0);
@@ -258,6 +282,7 @@ fn parse_args() -> Result<CliArgs> {
         reject_pancakes,
         strip_thin_obbs,
         feasibility,
+        split_worst,
         tangent_eps,
         metrics: metrics_flag,
         metrics_json,
@@ -306,6 +331,13 @@ fn print_usage() {
                             slab-merge failure mode (cost function can't
                             see surface drift). Try 0.05 to 0.15. Cost:
                             ~24 BVH queries per realized merge.
+       [--split-worst <f>]  post-merge: repeatedly find the live primitive
+                            with highest local Hausdorff > f × diag and
+                            split it along the longest PCA axis (median
+                            split) into two new primitives. Each accepted
+                            split adds 1 primitive. Targets the OBB-on-
+                            non-rectangular-region limit.
+           [--split-worst-max <int>]  cap on splits (default 32)
        [--no-tangent-eps]   set Q's tangent-term coefficient to 0 (paper
                             §3.4 says decided-per-mesh). Removes the
                             rotated-OBB failure mode on large flat regions;
@@ -416,6 +448,7 @@ fn main() -> Result<()> {
             reject_pancakes: args.reject_pancakes,
             strip_thin_obbs: args.strip_thin_obbs,
             feasibility: args.feasibility,
+            split_worst: args.split_worst,
             tangent_eps: args.tangent_eps,
         },
     );
@@ -429,7 +462,7 @@ fn main() -> Result<()> {
         .sum();
     let by_kind = count_by_kind(&result.primitives);
     eprintln!(
-        "merge: {:.1} ms, {} merges, {} stale, {} empty-rejected, {} feasibility-rejected, all-pairs={}, culled={}, thin-stripped={}, {} primitives, total vol {:.3}",
+        "merge: {:.1} ms, {} merges, {} stale, {} empty-rejected, {} feasibility-rejected, all-pairs={}, culled={}, splits={}, thin-stripped={}, {} primitives, total vol {:.3}",
         merge_ms,
         result.merges_done,
         result.merges_skipped_stale,
@@ -437,6 +470,7 @@ fn main() -> Result<()> {
         result.merges_rejected_feasibility,
         result.all_pairs_used,
         result.redundant_culled,
+        result.splits_done,
         result.thin_stripped,
         alive,
         total_vol,

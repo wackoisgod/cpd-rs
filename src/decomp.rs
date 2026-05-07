@@ -260,6 +260,110 @@ pub fn sharp_edge_axes(
 /// both gives stabler ranking than either alone — corners alone over-
 /// penalises OBBs at the merger granularity where their corners aren't
 /// the actual fit problem; centroids alone miss real OBB-corner outliers.
+/// Denser variant of local_hausdorff for the split path. Samples every
+/// vertex + every edge midpoint of the tessellation, then 256
+/// area-weighted random barycentric points across the primitive's
+/// surface. Designed to match the metrics module's sampling closely
+/// enough that an "improvement" under this metric also shows up as an
+/// improvement under the 10k-sample evaluation: the deterministic 24-
+/// sample local_hausdorff was missing face-interior drift on thin OBBs
+/// (rectangular bounding box sitting on a non-rectangular planar
+/// region — worst point can be away from any vertex), causing splits
+/// to be accepted that made the global Hausdorff *worse*.
+fn local_hausdorff_dense(p: &Prim, bvh: &Bvh, mesh: &Mesh) -> f32 {
+    const N_RANDOM: usize = 256;
+    let (verts, tris) = prim::tessellate(p);
+    if verts.is_empty() || tris.is_empty() {
+        return 0.0;
+    }
+    let mut max_d = 0.0f32;
+    let mut probe = |q: Point3<f32>| -> f32 {
+        let (_pt, _n, signed) = bvh.nearest_face(&mesh.verts, &mesh.tris, q);
+        signed.abs()
+    };
+    // Every vertex of the tessellation.
+    for v in &verts {
+        let d = probe(Point3::new(v[0], v[1], v[2]));
+        if d > max_d {
+            max_d = d;
+        }
+    }
+    // Every edge midpoint.
+    for t in &tris {
+        let a = verts[t[0] as usize];
+        let b = verts[t[1] as usize];
+        let c = verts[t[2] as usize];
+        for &(p0, p1) in &[(a, b), (b, c), (c, a)] {
+            let q = Point3::new(
+                0.5 * (p0[0] + p1[0]),
+                0.5 * (p0[1] + p1[1]),
+                0.5 * (p0[2] + p1[2]),
+            );
+            let d = probe(q);
+            if d > max_d {
+                max_d = d;
+            }
+        }
+    }
+    // Area-weighted random barycentric sampling — same scheme the
+    // metrics module uses, lighter sample count.
+    let mut tri_cum: Vec<f32> = Vec::with_capacity(tris.len());
+    let mut acc = 0.0f32;
+    for t in tris.iter() {
+        let a = Vector3::new(verts[t[0] as usize][0], verts[t[0] as usize][1], verts[t[0] as usize][2]);
+        let b = Vector3::new(verts[t[1] as usize][0], verts[t[1] as usize][1], verts[t[1] as usize][2]);
+        let c = Vector3::new(verts[t[2] as usize][0], verts[t[2] as usize][1], verts[t[2] as usize][2]);
+        acc += 0.5 * (b - a).cross(&(c - a)).norm();
+        tri_cum.push(acc);
+    }
+    if acc <= 0.0 {
+        return max_d;
+    }
+    // Tiny LCG seeded by the primitive's first vertex so results are
+    // deterministic per-primitive while different primitives use
+    // different sample sets.
+    let mut state: u64 = 0xCAFEF00D
+        ^ (verts[0][0].to_bits() as u64).wrapping_mul(2654435761)
+        ^ (verts[0][1].to_bits() as u64).wrapping_mul(40503)
+        ^ (verts[0][2].to_bits() as u64).wrapping_mul(67043);
+    let mut step = || {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+        ((state >> 32) as u32) as f32 * (1.0 / 4294967296.0)
+    };
+    for _ in 0..N_RANDOM {
+        let r = step() * acc;
+        // Lower bound search.
+        let mut lo = 0usize;
+        let mut hi = tri_cum.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if tri_cum[mid] >= r { hi = mid; } else { lo = mid + 1; }
+        }
+        let ti = lo.min(tri_cum.len() - 1);
+        let mut u = step();
+        let mut v = step();
+        if u + v > 1.0 {
+            u = 1.0 - u;
+            v = 1.0 - v;
+        }
+        let w = 1.0 - u - v;
+        let t = &tris[ti];
+        let a = verts[t[0] as usize];
+        let b = verts[t[1] as usize];
+        let c = verts[t[2] as usize];
+        let q = Point3::new(
+            a[0] * w + b[0] * u + c[0] * v,
+            a[1] * w + b[1] * u + c[1] * v,
+            a[2] * w + b[2] * u + c[2] * v,
+        );
+        let d = probe(q);
+        if d > max_d {
+            max_d = d;
+        }
+    }
+    max_d
+}
+
 fn local_hausdorff(p: &Prim, bvh: &Bvh, mesh: &Mesh) -> f32 {
     const K_VERT: usize = 12;
     const K_TRI: usize = 12;
@@ -636,6 +740,7 @@ pub struct DecompResult {
     pub redundant_culled: usize,
     pub thin_stripped: usize,
     pub rebalance_moves: usize,
+    pub splits_done: usize,
 }
 
 pub struct DecompOpts {
@@ -722,6 +827,20 @@ pub struct DecompOpts {
     /// about. Cost: BVH nearest-face on ~24 surface samples per
     /// realized merge.
     pub feasibility: Option<f32>,
+    /// Post-merge split-worst pass. None disables; Some((threshold_frac,
+    /// max_splits)) enables. After greedy merge converges (and rebalance
+    /// + cull run, if enabled), repeatedly find the live primitive with
+    /// the highest local Hausdorff. If h > `threshold_frac × mesh_diag`,
+    /// split its face set along the longest PCA axis (median split into
+    /// two halves) and refit each half. Accept only when both new halves
+    /// have strictly lower Hausdorff than the original.
+    ///
+    /// Each accepted split increases primitive count by 1. `max_splits`
+    /// caps growth. Targets the OBB-on-non-rectangular-planar-region
+    /// failure mode (e.g. L-shaped rooftops where the bounding rectangle
+    /// has corners protruding past the input outline) — a single OBB
+    /// can't fit those tightly, but two can.
+    pub split_worst: Option<(f32, usize)>,
     /// Per-face quadric's tangent-term coefficient (paper §3.4 "Coplanar
     /// Vertices", value `ε`). Default 0.01 stabilises the eigendecomp on
     /// coplanar regions. Setting to 0 makes Q rank-1, leaving in-plane
@@ -782,12 +901,13 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
     let nf = mesh.tris.len();
 
     // Build BVH up-front (needed by exposure / quality / empty-space /
-    // rebalance / feasibility).
+    // rebalance / feasibility / split-worst).
     let bvh: Option<Bvh> = if opts.empty_space.is_some()
         || opts.quality_beta > 0.0
         || opts.shell_aware
         || opts.rebalance.is_some()
         || opts.feasibility.is_some()
+        || opts.split_worst.is_some()
     {
         Some(Bvh::build(&mesh.verts, &mesh.tris))
     } else {
@@ -1310,6 +1430,30 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         redundant_culled = cull_redundant(&mut prims, &mesh.verts);
     }
 
+    let mut splits_done = 0usize;
+    if let (Some((threshold_frac, max_splits)), Some(bvh_ref)) =
+        (opts.split_worst, &bvh)
+    {
+        let t = std::time::Instant::now();
+        splits_done = split_worst_primitives(
+            &mut prims,
+            mesh,
+            adj,
+            &mut dsu,
+            &mut face_next,
+            bvh_ref,
+            opts.enabled,
+            threshold_frac,
+            max_splits,
+            opts.tangent_eps,
+        );
+        eprintln!(
+            "split-worst: {} primitives split in {:.1} ms",
+            splits_done,
+            t.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+
     let thin_stripped = match opts.strip_thin_obbs {
         Some(frac) => strip_thin_obbs(&mut prims, &mesh.verts, frac),
         None => 0,
@@ -1325,6 +1469,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         redundant_culled,
         thin_stripped,
         rebalance_moves,
+        splits_done,
     }
 }
 
@@ -1570,6 +1715,232 @@ fn rebalance_faces(
     }
 
     total_moves
+}
+
+/// Post-merge split-worst pass. After greedy merge converges, repeatedly
+/// find the live primitive with highest local Hausdorff > threshold ×
+/// diag and split its face set along the longest PCA axis (median split).
+/// Each accepted split increases primitive count by 1.
+///
+/// Targets the OBB-on-non-rectangular-planar-region failure mode that
+/// the merge cost can't see (V(merge) ≈ V(p0) + V(p1) for two flat
+/// slabs, even when the merged OBB's corners protrude metres past the
+/// input outline). After feasibility rejection has done what it can,
+/// the remaining drift comes from primitives whose vertex cloud is
+/// bimodal — e.g. an L-shaped rooftop. Splitting along the longest
+/// axis separates the modes and each half gets its own tight-fit OBB.
+///
+/// Acceptance: both halves must have strictly lower Hausdorff than the
+/// original. Otherwise the split would produce two equally-bad pieces.
+fn split_worst_primitives(
+    prims: &mut Vec<Primitive>,
+    mesh: &Mesh,
+    adj: &Adjacency,
+    dsu: &mut Dsu,
+    face_next: &mut [u32],
+    bvh: &Bvh,
+    enabled: PrimMask,
+    threshold_frac: f32,
+    max_splits: usize,
+    tangent_eps: f32,
+) -> usize {
+    let mesh_diag = crate::mesh::aabb_diag(&mesh.verts).max(1e-6);
+    let threshold = threshold_frac * mesh_diag;
+    let nf = mesh.tris.len();
+
+    // Compact face → primitive id, mirroring rebalance_faces.
+    let mut root_to_id: HashMap<u32, u32> = HashMap::new();
+    let mut face_assignment: Vec<u32> = Vec::with_capacity(nf);
+    for f in 0..nf {
+        let root = dsu.find(f as u32);
+        let id = match root_to_id.get(&root) {
+            Some(&id) => id,
+            None => {
+                let id = root_to_id.len() as u32;
+                root_to_id.insert(root, id);
+                id
+            }
+        };
+        face_assignment.push(id);
+    }
+    let mut n_prims = root_to_id.len();
+    let mut prim_faces: Vec<Vec<u32>> = vec![Vec::new(); n_prims];
+    for (fi, &pid) in face_assignment.iter().enumerate() {
+        prim_faces[pid as usize].push(fi as u32);
+    }
+
+    // Refit each primitive so we have a current Hausdorff to rank by.
+    // We replace the cached `hausdorff` with the dense variant — the
+    // 24-sample one misses drift on rectangular OBBs sitting on
+    // non-rectangular planar regions (worst point is often a face- or
+    // edge-interior, not a vertex), and we'd rather pay 10× sampling
+    // cost on the few worst primitives than split the wrong ones.
+    let mut state: Vec<RebalanceState> = (0..n_prims)
+        .map(|pid| {
+            let mut s = refit_from_faces(&prim_faces[pid], mesh, enabled, bvh, tangent_eps);
+            s.hausdorff = local_hausdorff_dense(&s.prim, bvh, mesh);
+            s
+        })
+        .collect();
+    // `tried` flags primitives we've already attempted to split (and
+    // rejected) so the worst-search loop doesn't re-pick them every
+    // iteration. Reset on a successful split since a primitive's faces
+    // may have been replaced wholesale via an earlier split's
+    // re-fit (extremely unlikely but cheap to be safe).
+    let mut tried: Vec<bool> = vec![false; n_prims];
+
+    let mut splits_done = 0usize;
+    while splits_done < max_splits {
+        let mut worst_pid: Option<usize> = None;
+        let mut worst_h = threshold;
+        for (pid, s) in state.iter().enumerate() {
+            if !tried[pid] && prim_faces[pid].len() >= 2 && s.hausdorff > worst_h {
+                worst_h = s.hausdorff;
+                worst_pid = Some(pid);
+            }
+        }
+        let pid = match worst_pid {
+            Some(p) => p,
+            None => break,
+        };
+
+        // Run PCA on the primitive's vertex cloud. PCA's longest axis is
+        // typically the right split direction, but on L-shaped planar
+        // regions (the dominant failure case) the longest axis is
+        // sometimes the L's diagonal, which median-split cuts at 45°
+        // and does not separate the L's arms. Try splits along all 3
+        // PCA axes plus the 3 world axes; pick the one that produces
+        // the lowest max-Hausdorff between the two halves.
+        let pts: Vec<Point3<f32>> = state[pid]
+            .vertex_indices
+            .iter()
+            .map(|&i| mesh.verts[i as usize])
+            .collect();
+        if pts.len() < 4 {
+            tried[pid] = true;
+            continue;
+        }
+        let pca = pca_axes(&pts);
+        let candidate_axes: [Vector3<f32>; 6] = [
+            pca[0],
+            pca[1],
+            pca[2],
+            Vector3::new(1.0, 0.0, 0.0),
+            Vector3::new(0.0, 1.0, 0.0),
+            Vector3::new(0.0, 0.0, 1.0),
+        ];
+
+        let mut best_split: Option<(RebalanceState, RebalanceState, Vec<u32>, Vec<u32>)> = None;
+        let mut best_max_h = state[pid].hausdorff;
+
+        for axis in &candidate_axes {
+            let mut face_proj: Vec<(u32, f32)> = prim_faces[pid]
+                .iter()
+                .map(|&fi| {
+                    let t = mesh.tris[fi as usize];
+                    let c = (mesh.verts[t[0] as usize].coords
+                        + mesh.verts[t[1] as usize].coords
+                        + mesh.verts[t[2] as usize].coords)
+                        / 3.0;
+                    (fi, c.dot(axis))
+                })
+                .collect();
+            face_proj.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+            let mid = face_proj.len() / 2;
+            let faces_a: Vec<u32> = face_proj[..mid].iter().map(|&(fi, _)| fi).collect();
+            let faces_b: Vec<u32> = face_proj[mid..].iter().map(|&(fi, _)| fi).collect();
+            if faces_a.is_empty() || faces_b.is_empty() {
+                continue;
+            }
+            let mut new_a = refit_from_faces(&faces_a, mesh, enabled, bvh, tangent_eps);
+            let mut new_b = refit_from_faces(&faces_b, mesh, enabled, bvh, tangent_eps);
+            new_a.hausdorff = local_hausdorff_dense(&new_a.prim, bvh, mesh);
+            new_b.hausdorff = local_hausdorff_dense(&new_b.prim, bvh, mesh);
+            let new_max_h = new_a.hausdorff.max(new_b.hausdorff);
+            if new_max_h < best_max_h {
+                best_max_h = new_max_h;
+                best_split = Some((new_a, new_b, faces_a, faces_b));
+            }
+        }
+
+        let (new_a, new_b, faces_a, faces_b) = match best_split {
+            Some(s) => s,
+            None => {
+                tried[pid] = true;
+                continue;
+            }
+        };
+
+        // Accept: keep current pid for half A, allocate a new pid for B.
+        let new_pid = n_prims as u32;
+        for &fi in &faces_b {
+            face_assignment[fi as usize] = new_pid;
+        }
+        prim_faces[pid] = faces_a;
+        prim_faces.push(faces_b);
+        state[pid] = new_a;
+        state.push(new_b);
+        tried.push(false);
+        n_prims += 1;
+        splits_done += 1;
+    }
+
+    if splits_done == 0 {
+        return 0;
+    }
+
+    // Rebuild dsu + face_next + prims from the final face assignment.
+    // Same pattern as rebalance_faces.
+    *dsu = Dsu::new(nf);
+    for pid in 0..n_prims {
+        let faces = &prim_faces[pid];
+        if faces.is_empty() {
+            continue;
+        }
+        let root = faces[0];
+        for &f in &faces[1..] {
+            dsu.link(root, f);
+        }
+        for i in 0..faces.len() {
+            let next = if i + 1 < faces.len() {
+                faces[i + 1]
+            } else {
+                faces[0]
+            };
+            face_next[faces[i] as usize] = next;
+        }
+        let s = &state[pid];
+        prims[root as usize] = Primitive {
+            alive: true,
+            version: prims[root as usize].version + 1,
+            q: s.q,
+            prim: s.prim.clone(),
+            volume: s.volume,
+            weighted_volume: s.weighted_volume,
+            face_count: faces.len() as u32,
+            vertex_indices: s.vertex_indices.clone(),
+            neighbors: HashSet::new(),
+        };
+    }
+    for fi in 0..nf {
+        if dsu.find(fi as u32) != fi as u32 {
+            prims[fi].alive = false;
+            prims[fi].vertex_indices = Vec::new();
+            prims[fi].face_count = 0;
+            prims[fi].neighbors.clear();
+        }
+    }
+    for f in 0..nf {
+        let p = dsu.find(f as u32);
+        for &nf_idx in &adj.neighbors[f] {
+            let q = dsu.find(nf_idx);
+            if p != q {
+                prims[p as usize].neighbors.insert(q);
+            }
+        }
+    }
+
+    splits_done
 }
 
 /// Drop primitive A if every vertex it subsumes is also enclosed by some

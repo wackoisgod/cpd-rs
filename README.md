@@ -58,6 +58,11 @@ cpd <mesh.glb> <target_n> [out.obj]
                                    local Hausdorff > f × diag. Try 0.15 for
                                    architecture meshes; no-op on meshes
                                    without slab pathology.
+    [--split-worst <f>]            experimental post-merge: split primitives
+                                   with local Hausdorff > f × diag along
+                                   their longest PCA / world axis (median
+                                   split). Mixed results — see section.
+        [--split-worst-max <int>]  cap on splits (default 32)
     [--no-tangent-eps]             disable Q's ε·ttᵀ in-plane bias (architecture)
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
@@ -120,6 +125,7 @@ handles images (including agentic tooling).
 | §4.4 | One-way Hausdorff / Chamfer evaluation metrics | ✓ |
 | ext. | Reverse Hausdorff (input → primitive surface) + coverage fraction | ✓ |
 | ext. | Merge-time feasibility check (rejects slab merges, paper §3.3 unsolved) | ✓ |
+| ext. | Post-merge split-worst pass (experimental, mixed results) | ✓ |
 
 ### Extensions beyond the paper
 
@@ -336,6 +342,84 @@ handles images (including agentic tooling).
   Default off (0.15 doesn't cost anything on non-architecture
   meshes, but is a behavioural change). Recommended for any
   environment / architectural input.
+
+- **Post-merge split-worst (experimental, `--split-worst <f>`).**
+  After merge converges (and rebalance + redundant cull run, if
+  enabled), repeatedly find the live primitive with highest local
+  Hausdorff > `f × mesh_diag` and split its face set into two new
+  primitives. Each accepted split adds 1 primitive. Targets the
+  follow-on of the slab failure mode that feasibility can't reach:
+  primitives that *individually* pass the merge-time feasibility
+  check but still drift past their input region (e.g. an OBB on an
+  L-shaped rooftop — every individual merge step looked fine, but
+  the cumulative result is a rectangular OBB that doesn't fit the
+  L's outline).
+
+  Split mechanics:
+  1. Sort the primitive's faces by their centroid's projection onto
+     a candidate axis. Try 6 axes — all 3 PCA axes of the vertex
+     cloud + the 3 world axes — and pick the one that produces the
+     lowest combined local Hausdorff between the two halves.
+  2. Median split into two face sets. Refit each half.
+  3. Accept iff both halves have strictly lower local Hausdorff
+     than the parent. Otherwise mark "tried" and move on.
+  4. Local Hausdorff for split decisions uses a 280-sample dense
+     variant (vertices + edge midpoints + 256 area-weighted random
+     barycentric points) — the 24-sample version used by rebalance
+     mis-ranked which primitive was actually worst, causing splits
+     to make the global metric *worse*.
+
+  **Mixed and inconsistent in practice — like `--rebalance`.**
+  Building (paper §4.4 forward Hausdorff, 100k samples to cut
+  metric noise):
+
+  | N    | default | --feasibility 0.15 | --split-worst 0.05 |
+  | ---- | ------- | ------------------ | ------------------ |
+  | 64   | 23.60   | **12.39**          | 23.60 (no-op)      |
+  | 128  | 23.60   | 11.84              | 12.03              |
+  | 256  | 23.60   | 11.99              | **11.34**          |
+  | 512  | 23.27   | 12.75              | **11.30**          |
+
+  Split helps building at higher N (where the budget allows the
+  added primitives) and matches feasibility at moderate N. At low
+  N (≤64) it doesn't fire because the budget is too tight to
+  afford new primitives.
+
+  Other meshes (10k samples, more noise):
+
+  | mesh   | N   | default | --split-worst 0.05 | Δ        |
+  | ------ | --- | ------- | ------------------ | -------- |
+  | rock   | 128 | 4.26    | 4.60               | +0.34pp  |
+  | blink  | 128 | 6.26    | **4.38**           | -1.88pp  |
+  | ram    | 128 | 5.60    | 6.10               | +0.50pp  |
+
+  Blink (mechanical/vehicle) shows real ~30% Hausdorff
+  improvement: the splits hit the long thin panels where one OBB
+  was bridging multiple disconnected sub-panels. Rock and ram
+  show small regressions.
+
+  **Do not combine with `--feasibility`.** Empirically the two
+  flags are anti-synergistic on the building (combo: ~16% vs
+  ~12% for either alone). Feasibility blocks the worst slab
+  merges leaving primitives that are tight-but-not-perfect; split
+  then attacks them and produces sliver alternatives that drift
+  similarly. Use one or the other, not both.
+
+  Why it underperforms a clean win:
+  - Median-split-along-PCA-axis is the wrong cut for L-shaped
+    regions: PCA's longest axis is the L's *diagonal*, and a
+    median cut at 45° doesn't separate the two arms. Sweeping all
+    3 PCA + 3 world axes helps but doesn't fully fix it.
+  - The acceptance check (both halves' local Hausdorff strictly
+    less than parent's) bounds the local result but the *new
+    surface* introduced where the two halves abut isn't on the
+    input mesh, and can drift in its own right.
+
+  Future directions: k-means clustering of vertices for cleaner
+  L-arm separation; multi-position splits (33/66, not just 50/50);
+  recursive split-and-merge to escape local minima. Default off,
+  same status as `--rebalance` — kept as an experimental option
+  and as scaffolding for those follow-ups.
 
 - **Iterative face-rebalance (experimental, `--rebalance`).** After the
   greedy merge completes, run Lloyd-style face migration: for each
