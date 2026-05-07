@@ -46,6 +46,7 @@ cpd <mesh.glb> <target_n> [out.obj]
     [--no-refine]                  disable post-merge orientation refit
     [--quality <beta>]             experimental Hausdorff-aware refit
     [--shell]                      experimental shell-aware orientation
+    [--proximity]                  spatial-proximity replaces all-pairs fallback
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
         [--empty-space-distance <frac-of-diag>]   default 0.01
@@ -134,6 +135,36 @@ handles images (including agentic tooling).
   at N=128 (4.26% → 3.74% Hausdorff) but can *worsen* at N=256 because
   greedy refit decisions don't always reduce the global max-Hausdorff.
   Try `--quality 1` to `--quality 5`; default `0` (off).
+
+- **Spatial-proximity merges (`--proximity`).** Replaces the all-pairs
+  fallback (paper §3.4) with a spatially-filtered version: when the
+  topology PQ drains, candidate edges are pushed only between live
+  primitives whose AABBs are within `--proximity-r` (fraction of input
+  diagonal, default 0.05) and whose dominant Q-normals differ by at
+  most `--proximity-angle` degrees (default 45). Each primitive gets
+  at most `--proximity-k` neighbours (default 2). Post-merge candidate
+  generation also uses these guards.
+
+  Compared to all-pairs:
+  - Avoids the "monster primitive" failure mode where unrelated
+    distant components get wrapped into a single OBB.
+  - Honest target N: refuses guard-failing merges, so the algorithm
+    may stop short of the requested N (treat the request as a
+    *minimum* primitive count).
+  - 3× faster on heavily-fragmented inputs (ram-visual: 2.9 s → 0.9 s).
+
+  Measured impact:
+
+  | mesh         | N    | metric    | baseline (all-pairs) | --proximity |
+  | ------------ | ---- | --------- | -------------------- | ----------- |
+  | blink        | 64   | Hausdorff | 27.0% (forced merge) | **22.4%**   |
+  | blink        | 64   | reached N | 64                   | 64          |
+  | ram-visual   | 64   | reached N | 64 (forced)          | 237 (honest)|
+  | ram-visual   | 64   | wall-time | 2940 ms              | **905 ms**  |
+
+  When a forced low-N is required, leave `--proximity` off so the
+  default all-pairs fallback fires. When quality matters more than the
+  exact N, `--proximity` is the better default.
 
 - **Shell-aware orientation (experimental, `--shell`).** Pre-computes
   per-face ambient-occlusion exposure: cast 32 stratified rays in each

@@ -25,6 +25,7 @@ struct CliArgs {
     refine_orient: bool,
     quality_beta: f32,
     shell_aware: bool,
+    proximity: Option<(f32, usize, f32)>, // (max_dist_frac, k, max_angle_rad)
     metrics: bool,
     metrics_json: Option<PathBuf>,
 }
@@ -40,6 +41,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut refine_orient = true;
     let mut quality_beta: f32 = 0.0;
     let mut shell_aware = false;
+    let mut proximity: Option<(f32, usize, f32)> = None;
     let mut metrics_flag = false;
     let mut metrics_json: Option<PathBuf> = None;
     let mut positional: Vec<String> = Vec::new();
@@ -79,6 +81,35 @@ fn parse_args() -> Result<CliArgs> {
             "--shell" => {
                 args.remove(0);
                 shell_aware = true;
+            }
+            "--proximity" => {
+                args.remove(0);
+                // Default knobs: 5% of diag, k=2 nearest, 45° angle limit.
+                proximity = Some((0.05, 2, std::f32::consts::FRAC_PI_4));
+            }
+            "--proximity-r" => {
+                args.remove(0);
+                let v = args.first().cloned().context("--proximity-r needs f32")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                let prev = proximity.unwrap_or((0.05, 2, std::f32::consts::FRAC_PI_4));
+                proximity = Some((f, prev.1, prev.2));
+            }
+            "--proximity-k" => {
+                args.remove(0);
+                let v = args.first().cloned().context("--proximity-k needs usize")?;
+                args.remove(0);
+                let k: usize = v.parse().context("not an integer")?;
+                let prev = proximity.unwrap_or((0.05, 2, std::f32::consts::FRAC_PI_4));
+                proximity = Some((prev.0, k, prev.2));
+            }
+            "--proximity-angle" => {
+                args.remove(0);
+                let v = args.first().cloned().context("--proximity-angle needs degrees")?;
+                args.remove(0);
+                let deg: f32 = v.parse().context("not a float")?;
+                let prev = proximity.unwrap_or((0.05, 2, std::f32::consts::FRAC_PI_4));
+                proximity = Some((prev.0, prev.1, deg.to_radians()));
             }
             "--metrics" => {
                 args.remove(0);
@@ -157,6 +188,7 @@ fn parse_args() -> Result<CliArgs> {
         refine_orient,
         quality_beta,
         shell_aware,
+        proximity,
         metrics: metrics_flag,
         metrics_json,
     })
@@ -177,6 +209,14 @@ fn print_usage() {
                             ambient-occlusion exposure; weights Q and PCA by
                             it so interior geometry doesn't bias axes. Best
                             for kitbashed / scanned assets.
+       [--proximity]        spatial-proximity merges between disconnected
+                            components. Adds candidate edges between nearby
+                            components in the initial PQ, with cost ordering
+                            so small fragments merge first. Replaces the
+                            all-pairs failure mode for kitbashed assets.
+           [--proximity-r <frac-of-diag>]   default 0.05
+           [--proximity-k <int>]            default 2
+           [--proximity-angle <deg>]        default 45
        [--metrics]     compute one-way Hausdorff/Chamfer (paper §4.4) + volume ratio
        [--metrics-json <path>]   also write metrics as JSON to <path>
        [--empty-space]   coarse heuristic — reliably flags large bridges
@@ -267,6 +307,7 @@ fn main() -> Result<()> {
             refine_orient: args.refine_orient,
             quality_beta: args.quality_beta,
             shell_aware: args.shell_aware,
+            proximity: args.proximity,
         },
     );
     let merge_ms = t2.elapsed().as_secs_f64() * 1000.0;

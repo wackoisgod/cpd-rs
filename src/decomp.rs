@@ -399,6 +399,134 @@ fn live_indices(prims: &[Primitive]) -> Vec<u32> {
         .collect()
 }
 
+/// Per-primitive bookkeeping for the proximity fallback.
+struct LiveSummary {
+    aabbs: Vec<(Point3<f32>, Point3<f32>)>,
+    normals: Vec<Vector3<f32>>,
+}
+
+fn live_summary(prims: &[Primitive], live: &[u32]) -> LiveSummary {
+    let mut aabbs = Vec::with_capacity(live.len());
+    let mut normals = Vec::with_capacity(live.len());
+    for &i in live {
+        let (lo, hi) = prim::world_aabb(&prims[i as usize].prim);
+        aabbs.push((Point3::new(lo[0], lo[1], lo[2]), Point3::new(hi[0], hi[1], hi[2])));
+        let q = prims[i as usize].q;
+        let sym = (q + q.transpose()) * 0.5;
+        let dec = SymmetricEigen::new(sym);
+        let mut max_i = 0;
+        for k in 1..3 {
+            if dec.eigenvalues[k].abs() > dec.eigenvalues[max_i].abs() {
+                max_i = k;
+            }
+        }
+        let v = dec.eigenvectors.column(max_i).into_owned();
+        let nv = if v.norm_squared() > 1e-20 {
+            v.normalize()
+        } else {
+            Vector3::new(0.0, 1.0, 0.0)
+        };
+        normals.push(nv);
+    }
+    LiveSummary { aabbs, normals }
+}
+
+fn aabb_to_aabb_dist(
+    a: &(Point3<f32>, Point3<f32>),
+    b: &(Point3<f32>, Point3<f32>),
+) -> f32 {
+    let mut d2 = 0.0f32;
+    for i in 0..3 {
+        let gap = if a.1[i] < b.0[i] {
+            b.0[i] - a.1[i]
+        } else if b.1[i] < a.0[i] {
+            a.0[i] - b.1[i]
+        } else {
+            0.0
+        };
+        d2 += gap * gap;
+    }
+    d2.sqrt()
+}
+
+/// Spatial-proximity fallback: for each live primitive, push k candidate
+/// edges to its closest neighbours by AABB distance, dropping pairs whose
+/// dominant Q-normals differ by more than `max_angle_rad`. Compared to
+/// the brute all-pairs phase this dramatically narrows the candidate set
+/// on heavily fragmented meshes.
+fn push_proximity_pairs(
+    prims: &[Primitive],
+    mesh_verts: &[Point3<f32>],
+    pq: &mut BinaryHeap<PqEntry>,
+    volume_threshold: f32,
+    enabled: PrimMask,
+    max_dist: f32,
+    k: usize,
+    max_angle_rad: f32,
+) -> usize {
+    let live = live_indices(prims);
+    if live.len() < 2 {
+        return 0;
+    }
+    let summary = live_summary(prims, &live);
+    let cos_min = max_angle_rad.cos();
+
+    let mut pair_keys: HashSet<(u32, u32)> = HashSet::new();
+    for i in 0..live.len() {
+        let mut dists: Vec<(usize, f32)> = (0..live.len())
+            .filter(|&j| j != i)
+            .map(|j| (j, aabb_to_aabb_dist(&summary.aabbs[i], &summary.aabbs[j])))
+            .collect();
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(Ordering::Equal));
+        for &(j, d) in dists.iter().take(k) {
+            if d > max_dist {
+                continue;
+            }
+            let cos = summary.normals[i].dot(&summary.normals[j]).abs();
+            if cos < cos_min {
+                continue;
+            }
+            let a = live[i];
+            let b = live[j];
+            if prims[a as usize].neighbors.contains(&b) {
+                continue;
+            }
+            let key = if a < b { (a, b) } else { (b, a) };
+            pair_keys.insert(key);
+        }
+    }
+
+    let pairs: Vec<(u32, u32)> = pair_keys.into_iter().collect();
+    let entries: Vec<PqEntry> = pairs
+        .par_iter()
+        .filter_map(|&(a, b)| {
+            let pa = &prims[a as usize];
+            let pb = &prims[b as usize];
+            let (_q, prim_fit, vol, wvol, _vidx) =
+                merge_pair(pa, pb, mesh_verts, enabled);
+            let cost = vol - (pa.volume + pb.volume);
+            if cost > volume_threshold {
+                return None;
+            }
+            Some(PqEntry {
+                cost,
+                a,
+                b,
+                va: pa.version,
+                vb: pb.version,
+                prim: prim_fit,
+                volume: vol,
+                weighted_volume: wvol,
+            })
+        })
+        .collect();
+    let pushed = entries.len();
+    for e in entries {
+        pq.push(e);
+    }
+    pushed
+}
+
 fn push_all_pairs(
     prims: &[Primitive],
     mesh_verts: &[Point3<f32>],
@@ -483,6 +611,13 @@ pub struct DecompOpts {
     /// only. Containment fitting still uses every subsumed vertex, so
     /// the paper's enclosure guarantee is preserved.
     pub shell_aware: bool,
+    /// Spatial-proximity candidate merges. None disables; Some(...)
+    /// enables. The (max_dist_frac, k_nearest, max_angle_rad) tuple
+    /// adds, before merging starts, candidate edges between components
+    /// whose AABBs are within `max_dist_frac * scene_diag`, capping at
+    /// `k_nearest` neighbours per component, and rejecting pairs whose
+    /// dominant normals differ by more than `max_angle_rad`.
+    pub proximity: Option<(f32, usize, f32)>,
 }
 
 /// Fraction of stratified-grid samples inside `prim` that are deeper than
@@ -699,13 +834,38 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                     );
                     break;
                 }
-                let pushed =
-                    push_all_pairs(&prims, &mesh.verts, &mut pq, opts.volume_threshold, opts.enabled);
+                let pushed = if let Some((r_frac, k, angle_rad)) = opts.proximity {
+                    let max_dist = r_frac * mesh_diag;
+                    let p = push_proximity_pairs(
+                        &prims,
+                        &mesh.verts,
+                        &mut pq,
+                        opts.volume_threshold,
+                        opts.enabled,
+                        max_dist,
+                        k,
+                        angle_rad,
+                    );
+                    eprintln!(
+                        "topology PQ drained at {} primitives; pushed {} proximity candidates (k={}, r={:.3}, angle<={:.0}°)",
+                        alive_count, p, k, max_dist, angle_rad.to_degrees(),
+                    );
+                    p
+                } else {
+                    let p = push_all_pairs(
+                        &prims,
+                        &mesh.verts,
+                        &mut pq,
+                        opts.volume_threshold,
+                        opts.enabled,
+                    );
+                    eprintln!(
+                        "topology PQ drained at {} primitives; pushed {} all-pairs candidates",
+                        alive_count, p
+                    );
+                    p
+                };
                 all_pairs_used = true;
-                eprintln!(
-                    "topology PQ drained at {} primitives; pushed {} all-pairs candidates",
-                    alive_count, pushed
-                );
                 if pushed == 0 {
                     break;
                 }
@@ -890,12 +1050,46 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         merges_done += 1;
 
         let candidates: Vec<u32> = if all_pairs_used {
-            prims
-                .iter()
-                .enumerate()
-                .filter(|(i, p)| p.alive && *i != a)
-                .map(|(i, _)| i as u32)
-                .collect()
+            // After the topology drain we operate on logical neighbours.
+            // In proximity mode we want only spatially-close, similarly-
+            // oriented prims; in all-pairs mode every live primitive.
+            if let Some((r_frac, k, angle_rad)) = opts.proximity {
+                let live = live_indices(&prims);
+                let summary = live_summary(&prims, &live);
+                // find this primitive's index in `live`
+                let me_in_live = live.iter().position(|&x| x as usize == a);
+                let max_dist = r_frac * mesh_diag;
+                let cos_min = angle_rad.cos();
+                if let Some(i) = me_in_live {
+                    let mut dists: Vec<(usize, f32)> = (0..live.len())
+                        .filter(|&j| j != i)
+                        .map(|j| (j, aabb_to_aabb_dist(&summary.aabbs[i], &summary.aabbs[j])))
+                        .collect();
+                    dists.sort_by(|x, y| x.1.partial_cmp(&y.1).unwrap_or(Ordering::Equal));
+                    dists
+                        .into_iter()
+                        .take(k)
+                        .filter_map(|(j, d)| {
+                            if d > max_dist {
+                                return None;
+                            }
+                            if summary.normals[i].dot(&summary.normals[j]).abs() < cos_min {
+                                return None;
+                            }
+                            Some(live[j])
+                        })
+                        .collect()
+                } else {
+                    Vec::new()
+                }
+            } else {
+                prims
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, p)| p.alive && *i != a)
+                    .map(|(i, _)| i as u32)
+                    .collect()
+            }
         } else {
             prims[a].neighbors.iter().copied().collect()
         };

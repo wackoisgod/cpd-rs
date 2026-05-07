@@ -222,6 +222,226 @@ pub fn compute_face_exposure(
         .collect()
 }
 
+/// Find connected components of the topology graph using DSU. Returns
+/// a face → component-id vector. Used by proximity-merge generation to
+/// pair up nearby disconnected components.
+pub fn find_components(adj: &Adjacency) -> Vec<u32> {
+    let nf = adj.neighbors.len();
+    let mut dsu = crate::dsu::Dsu::new(nf);
+    for (fi, ns) in adj.neighbors.iter().enumerate() {
+        for &nj in ns {
+            dsu.union(fi as u32, nj);
+        }
+    }
+    // Compress to consecutive component ids.
+    let mut canonical: HashMap<u32, u32> = HashMap::new();
+    let mut comp_id = Vec::with_capacity(nf);
+    for fi in 0..nf {
+        let root = dsu.find(fi as u32);
+        let id = match canonical.get(&root) {
+            Some(&id) => id,
+            None => {
+                let id = canonical.len() as u32;
+                canonical.insert(root, id);
+                id
+            }
+        };
+        comp_id.push(id);
+    }
+    comp_id
+}
+
+/// Per-component pre-computation used by proximity-merge generation.
+pub struct ComponentSummary {
+    /// Number of components.
+    pub n: usize,
+    /// face_idx → component id
+    pub face_comp: Vec<u32>,
+    /// per-component centroid (area-weighted)
+    pub centroids: Vec<Point3<f32>>,
+    /// per-component AABB (lo, hi)
+    pub aabbs: Vec<(Point3<f32>, Point3<f32>)>,
+    /// per-component dominant normal (largest eigenvector of summed Q),
+    /// roughly the "facing direction" of the surface
+    pub normals: Vec<Vector3<f32>>,
+    /// face indices grouped by component
+    pub faces_per: Vec<Vec<u32>>,
+}
+
+pub fn summarize_components(mesh: &Mesh, adj: &Adjacency) -> ComponentSummary {
+    let face_comp = find_components(adj);
+    let n = (face_comp.iter().copied().max().map(|m| m + 1).unwrap_or(0)) as usize;
+    let mut faces_per: Vec<Vec<u32>> = vec![Vec::new(); n];
+    for (fi, &c) in face_comp.iter().enumerate() {
+        faces_per[c as usize].push(fi as u32);
+    }
+
+    // Per-component area-weighted centroid + AABB
+    let mut centroids: Vec<Point3<f32>> = vec![Point3::origin(); n];
+    let mut aabbs: Vec<(Point3<f32>, Point3<f32>)> = vec![
+        (
+            Point3::new(f32::INFINITY, f32::INFINITY, f32::INFINITY),
+            Point3::new(f32::NEG_INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY),
+        );
+        n
+    ];
+    let mut total_area: Vec<f32> = vec![0.0; n];
+    let mut summed_q: Vec<nalgebra::Matrix3<f32>> = vec![nalgebra::Matrix3::zeros(); n];
+
+    for (fi, t) in mesh.tris.iter().enumerate() {
+        let c = face_comp[fi] as usize;
+        let a = mesh.verts[t[0] as usize];
+        let b = mesh.verts[t[1] as usize];
+        let cp = mesh.verts[t[2] as usize];
+        let cross = (b - a).cross(&(cp - a));
+        let area = 0.5 * cross.norm();
+        if area < 1e-20 {
+            continue;
+        }
+        let face_centroid = (a.coords + b.coords + cp.coords) / 3.0;
+        centroids[c].coords += face_centroid * area;
+        total_area[c] += area;
+        for &v in &[a, b, cp] {
+            for k in 0..3 {
+                if v[k] < aabbs[c].0[k] {
+                    aabbs[c].0[k] = v[k];
+                }
+                if v[k] > aabbs[c].1[k] {
+                    aabbs[c].1[k] = v[k];
+                }
+            }
+        }
+        let n_vec = cross / cross.norm();
+        summed_q[c] += area * n_vec * n_vec.transpose();
+    }
+    for c in 0..n {
+        if total_area[c] > 0.0 {
+            centroids[c].coords /= total_area[c];
+        }
+    }
+
+    let mut normals: Vec<Vector3<f32>> = Vec::with_capacity(n);
+    for q in &summed_q {
+        let sym = (q + q.transpose()) * 0.5;
+        let dec = nalgebra::SymmetricEigen::new(sym);
+        // largest eigenvalue's eigenvector is the area-weighted normal
+        let mut max_i = 0;
+        for i in 1..3 {
+            if dec.eigenvalues[i].abs() > dec.eigenvalues[max_i].abs() {
+                max_i = i;
+            }
+        }
+        let v = dec.eigenvectors.column(max_i).into_owned();
+        let nv = if v.norm_squared() > 1e-20 {
+            v.normalize()
+        } else {
+            Vector3::new(0.0, 1.0, 0.0)
+        };
+        normals.push(nv);
+    }
+
+    ComponentSummary {
+        n,
+        face_comp,
+        centroids,
+        aabbs,
+        normals,
+        faces_per,
+    }
+}
+
+/// Build proximity edges between disconnected components: for each
+/// component, find its `k` nearest neighbors by AABB-to-AABB distance,
+/// reject pairs whose dominant normals differ by more than `max_angle_rad`,
+/// and produce one representative face-edge per accepted pair (closest
+/// face-centroid pair).
+pub fn build_proximity_edges(
+    mesh: &Mesh,
+    summary: &ComponentSummary,
+    k: usize,
+    max_dist: f32,
+    max_angle_rad: f32,
+) -> Vec<(u32, u32)> {
+    if summary.n < 2 {
+        return Vec::new();
+    }
+
+    // Per-component face centroids — precomputed once for closest-pair
+    // search inside accepted component pairs.
+    let mut face_centroid: Vec<Point3<f32>> = Vec::with_capacity(mesh.tris.len());
+    for t in &mesh.tris {
+        let a = mesh.verts[t[0] as usize].coords;
+        let b = mesh.verts[t[1] as usize].coords;
+        let c = mesh.verts[t[2] as usize].coords;
+        face_centroid.push(Point3::from((a + b + c) / 3.0));
+    }
+
+    let cos_min = max_angle_rad.cos();
+    let mut edges: HashMap<(u32, u32), f32> = HashMap::new();
+
+    // For each component, find k-nearest neighbours by AABB-to-AABB
+    // distance. O(C^2) but C is in the hundreds at most.
+    for i in 0..summary.n {
+        let mut dists: Vec<(usize, f32)> = (0..summary.n)
+            .filter(|&j| j != i)
+            .map(|j| (j, aabb_to_aabb_distance(&summary.aabbs[i], &summary.aabbs[j])))
+            .collect();
+        dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+
+        for &(j, d) in dists.iter().take(k) {
+            if d > max_dist {
+                continue;
+            }
+            // Orientation guard: components with dominant normals that
+            // differ too much shouldn't merge (e.g. roof-vs-wall across
+            // a gap).
+            let cos = summary.normals[i].dot(&summary.normals[j]).abs();
+            if cos < cos_min {
+                continue;
+            }
+            // Find the closest face-centroid pair between the two components.
+            let faces_i = &summary.faces_per[i];
+            let faces_j = &summary.faces_per[j];
+            let mut best: (u32, u32, f32) = (faces_i[0], faces_j[0], f32::INFINITY);
+            for &fi in faces_i {
+                for &fj in faces_j {
+                    let dd = (face_centroid[fi as usize] - face_centroid[fj as usize])
+                        .norm_squared();
+                    if dd < best.2 {
+                        best = (fi, fj, dd);
+                    }
+                }
+            }
+            let key = if best.0 < best.1 {
+                (best.0, best.1)
+            } else {
+                (best.1, best.0)
+            };
+            edges.entry(key).or_insert(best.2);
+        }
+    }
+
+    edges.into_iter().map(|(k, _)| k).collect()
+}
+
+fn aabb_to_aabb_distance(
+    a: &(Point3<f32>, Point3<f32>),
+    b: &(Point3<f32>, Point3<f32>),
+) -> f32 {
+    let mut d2 = 0.0f32;
+    for i in 0..3 {
+        let gap = if a.1[i] < b.0[i] {
+            b.0[i] - a.1[i]
+        } else if b.1[i] < a.0[i] {
+            a.0[i] - b.1[i]
+        } else {
+            0.0
+        };
+        d2 += gap * gap;
+    }
+    d2.sqrt()
+}
+
 /// Per-mesh detection of "sharp" feature edges: edges whose two incident
 /// faces meet at a dihedral angle above some threshold (i.e., a crease).
 /// The directions of these edges are useful as a third orientation
