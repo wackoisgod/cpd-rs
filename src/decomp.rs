@@ -227,6 +227,60 @@ pub fn sharp_edge_axes(
     Some(orthonormal_basis_from_seed(v0, v1))
 }
 
+/// Sample both tessellation vertices (catch corner protrusions on OBBs/
+/// prisms) and triangle centroids (catch face-bulge cases on smooth
+/// primitives), and return the max distance to the input mesh. Combining
+/// both gives stabler ranking than either alone — corners alone over-
+/// penalises OBBs at the merger granularity where their corners aren't
+/// the actual fit problem; centroids alone miss real OBB-corner outliers.
+fn local_hausdorff(p: &Prim, bvh: &Bvh, mesh: &Mesh) -> f32 {
+    const K_VERT: usize = 12;
+    const K_TRI: usize = 12;
+    let (verts, tris) = prim::tessellate(p);
+    let mut max_d = 0.0f32;
+
+    if !verts.is_empty() {
+        let stride = (verts.len() / K_VERT).max(1);
+        let mut vi = 0usize;
+        let mut count = 0usize;
+        while vi < verts.len() && count < K_VERT {
+            let v = verts[vi];
+            let q = Point3::new(v[0], v[1], v[2]);
+            let (_pt, _n, signed) = bvh.nearest_face(&mesh.verts, &mesh.tris, q);
+            let d = signed.abs();
+            if d > max_d {
+                max_d = d;
+            }
+            count += 1;
+            vi += stride;
+        }
+    }
+    if !tris.is_empty() {
+        let stride = (tris.len() / K_TRI).max(1);
+        let mut ti = 0usize;
+        let mut count = 0usize;
+        while ti < tris.len() && count < K_TRI {
+            let t = tris[ti];
+            let a = verts[t[0] as usize];
+            let b = verts[t[1] as usize];
+            let c = verts[t[2] as usize];
+            let q = Point3::new(
+                (a[0] + b[0] + c[0]) / 3.0,
+                (a[1] + b[1] + c[1]) / 3.0,
+                (a[2] + b[2] + c[2]) / 3.0,
+            );
+            let (_pt, _n, signed) = bvh.nearest_face(&mesh.verts, &mesh.tris, q);
+            let d = signed.abs();
+            if d > max_d {
+                max_d = d;
+            }
+            count += 1;
+            ti += stride;
+        }
+    }
+    max_d
+}
+
 /// Walk the cyclic linked list of faces for a primitive starting at `start`,
 /// yielding `count` distinct face indices.
 fn walk_faces<'a>(start: u32, count: u32, face_next: &'a [u32]) -> impl Iterator<Item = u32> + 'a {
@@ -415,6 +469,13 @@ pub struct DecompOpts {
     /// little cost per realized merge but tightens fits on elongated /
     /// near-coplanar regions where Q's axes can be biased.
     pub refine_orient: bool,
+    /// Hausdorff-aware refit. When > 0, the post-merge refit picks the
+    /// primitive minimising `weighted_volume * (1 + beta * h/diag)` where
+    /// `h` is sampled from the candidate primitive's surface to the input
+    /// mesh via a BVH nearest-face query. Sphere becomes a real candidate
+    /// in this mode (it usually loses on raw volume but can win on
+    /// Hausdorff for near-spherical regions). 0 disables.
+    pub quality_beta: f32,
 }
 
 /// Fraction of stratified-grid samples inside `prim` that are deeper than
@@ -498,11 +559,14 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
     // detection on PQ pop.
     let mut dsu = Dsu::new(nf);
 
-    let bvh: Option<Bvh> = if opts.empty_space.is_some() {
+    // Build the BVH if any feature that needs it is on (empty-space or
+    // Hausdorff-aware quality refit).
+    let bvh: Option<Bvh> = if opts.empty_space.is_some() || opts.quality_beta > 0.0 {
         Some(Bvh::build(&mesh.verts, &mesh.tris))
     } else {
         None
     };
+    let mesh_diag = crate::mesh::aabb_diag(&mesh.verts).max(1e-6);
 
     // Pre-compute sharp edges if orientation refinement is on. ~30° dihedral
     // threshold catches creases on architecture/CAD-style meshes without
@@ -645,37 +709,70 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                 .map(|&i| mesh.verts[i as usize])
                 .collect();
 
-            let mut best_prim = entry.prim;
-            let mut best_wvol = entry.weighted_volume;
-            let mut try_axes = |axes: [Vector3<f32>; 3], best: &mut Prim, best_wvol: &mut f32| {
-                let cand = prim::fit_best(axes, &pts, opts.enabled);
-                if cand.weighted_volume() < *best_wvol {
-                    *best_wvol = cand.weighted_volume();
-                    *best = cand;
+            // Selection criterion: when quality_beta == 0, just minimise
+            // weighted volume (paper-faithful). When > 0, minimise
+            // `weighted_volume * (1 + beta * h/diag)` where h is a cheap
+            // sampled max-distance from the primitive's surface to the
+            // input mesh via BVH. Sphere is included when quality is on.
+            let use_quality = opts.quality_beta > 0.0 && bvh.is_some();
+            let bvh_ref = bvh.as_ref();
+
+            let score = |p: &Prim| -> f32 {
+                if use_quality {
+                    let h = local_hausdorff(p, bvh_ref.unwrap(), mesh);
+                    p.weighted_volume() * (1.0 + opts.quality_beta * h / mesh_diag)
+                } else {
+                    p.weighted_volume()
                 }
             };
 
-            // Candidate 1: vertex PCA (geometric extent).
-            try_axes(pca_axes(&pts), &mut best_prim, &mut best_wvol);
-            // Candidate 2: tangent-plane PCA (auto-tangent-weight fix for
-            // near-coplanar regions).
-            try_axes(
-                tangent_plane_pca_axes(new_q, &pts),
-                &mut best_prim,
-                &mut best_wvol,
-            );
-            // Candidate 3: sharp-edge directions (feature-aligned). Walk the
-            // face linked lists of both primitives BEFORE the splice below.
+            let mut best_prim = entry.prim;
+            let mut best_score = score(&best_prim);
+
+            let mut try_axes = |axes: [Vector3<f32>; 3], best: &mut Prim, best_score: &mut f32| {
+                if use_quality {
+                    // try every primitive type for this orientation, score
+                    // each individually.
+                    let mask = if opts.enabled.obb || opts.enabled.sphere {
+                        let mut m = opts.enabled;
+                        m.sphere = true; // unconditional sphere in quality mode
+                        m
+                    } else {
+                        opts.enabled
+                    };
+                    for cand in prim::fit_all(axes, &pts, mask) {
+                        let s = score(&cand);
+                        if s < *best_score {
+                            *best_score = s;
+                            *best = cand;
+                        }
+                    }
+                } else {
+                    let cand = prim::fit_best(axes, &pts, opts.enabled);
+                    let s = cand.weighted_volume();
+                    if s < *best_score {
+                        *best_score = s;
+                        *best = cand;
+                    }
+                }
+            };
+
+            // Candidate 1: vertex PCA.
+            try_axes(pca_axes(&pts), &mut best_prim, &mut best_score);
+            // Candidate 2: tangent-plane PCA.
+            try_axes(tangent_plane_pca_axes(new_q, &pts), &mut best_prim, &mut best_score);
+            // Candidate 3: sharp-edge directions.
             if let Some(sharp_ref) = &sharp_edges {
                 let face_iter = walk_faces(a as u32, prims[a].face_count, &face_next)
                     .chain(walk_faces(b as u32, prims[b].face_count, &face_next));
                 if let Some(axes) = sharp_edge_axes(sharp_ref, face_iter) {
-                    try_axes(axes, &mut best_prim, &mut best_wvol);
+                    try_axes(axes, &mut best_prim, &mut best_score);
                 }
             }
 
             let v = best_prim.volume();
-            (best_prim, v, best_wvol)
+            let w = best_prim.weighted_volume();
+            (best_prim, v, w)
         } else {
             (entry.prim, entry.volume, entry.weighted_volume)
         };

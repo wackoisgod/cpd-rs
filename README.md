@@ -44,6 +44,7 @@ cpd <mesh.glb> <target_n> [out.obj]
     [--obb-only]
     [--no-cull]                    disable redundant-primitive cull
     [--no-refine]                  disable post-merge orientation refit
+    [--quality <beta>]             experimental Hausdorff-aware refit
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
         [--empty-space-distance <frac-of-diag>]   default 0.01
@@ -121,6 +122,17 @@ handles images (including agentic tooling).
   unrelated components together. We additionally require A and B to share
   at least one mesh vertex — i.e., they were topologically related at some
   point during the merge — which preserves tight per-component fits.
+
+- **Hausdorff-aware refit (experimental, `--quality <beta>`).** When `beta
+  > 0` the post-merge refit ranks candidates by
+  `weighted_volume * (1 + beta · h/diag)` instead of pure
+  `weighted_volume`, where `h` is sampled from the candidate primitive's
+  surface to the input mesh via the BVH. Sphere becomes a real candidate
+  in this mode (it's normally skipped because it always loses on raw
+  volume). **Mixed results across meshes:** helps notably on the rock-kit
+  at N=128 (4.26% → 3.74% Hausdorff) but can *worsen* at N=256 because
+  greedy refit decisions don't always reduce the global max-Hausdorff.
+  Try `--quality 1` to `--quality 5`; default `0` (off).
 
 - **Empty-space preservation (toggleable).** `--empty-space` adds a hard
   reject: sample 27 stratified points inside the candidate primitive's

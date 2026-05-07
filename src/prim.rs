@@ -690,6 +690,50 @@ pub fn fit_prism_best(
     best.unwrap()
 }
 
+/// All-candidate fit (no sphere skip), returns every primitive type as a
+/// Vec so the caller can apply a custom selection criterion (e.g. a
+/// Hausdorff-aware combined cost).
+pub fn fit_all(
+    axes: [Vector3<f32>; 3],
+    points: &[Point3<f32>],
+    enabled: PrimMask,
+) -> Vec<Prim> {
+    let obb = fit_obb(axes, points);
+    let obb_center = match &obb {
+        Prim::Obb { center, .. } => *center,
+        _ => unreachable!(),
+    };
+    let mut out: Vec<Prim> = Vec::with_capacity(6);
+    if enabled.obb {
+        out.push(obb.clone());
+    }
+    if enabled.sphere {
+        out.push(fit_sphere(obb_center, points));
+    }
+    if enabled.cylinder {
+        out.push(fit_cylinder_best(obb_center, axes, points));
+    }
+    if enabled.capsule {
+        out.push(fit_capsule_best(obb_center, axes, points));
+    }
+    if enabled.frustum {
+        // frustum needs a cylinder axis seed
+        let cyl = fit_cylinder_best(obb_center, axes, points);
+        let cyl_axis = match &cyl {
+            Prim::Cylinder { axis, .. } => *axis,
+            _ => axes[0],
+        };
+        out.push(fit_frustum(obb_center, cyl_axis, points));
+    }
+    if enabled.prism {
+        out.push(fit_prism_best(obb_center, axes, points));
+    }
+    if out.is_empty() {
+        out.push(obb);
+    }
+    out
+}
+
 /// Try every primitive type and return the one with the smallest weighted
 /// volume.
 pub fn fit_best(
