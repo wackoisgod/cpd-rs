@@ -66,15 +66,31 @@ pub fn axes_from_q(q: Matrix3<f32>) -> [Vector3<f32>; 3] {
             .partial_cmp(&dec.eigenvalues[i].abs())
             .unwrap_or(Ordering::Equal)
     });
-    let mut axes = [
-        dec.eigenvectors.column(idx[0]).into_owned(),
-        dec.eigenvectors.column(idx[1]).into_owned(),
-        dec.eigenvectors.column(idx[2]).into_owned(),
-    ];
-    axes[0] = axes[0].normalize();
-    axes[1] = (axes[1] - axes[0] * axes[0].dot(&axes[1])).normalize();
-    axes[2] = axes[0].cross(&axes[1]).normalize();
-    axes
+    let v0 = dec.eigenvectors.column(idx[0]).into_owned();
+    let v1 = dec.eigenvectors.column(idx[1]).into_owned();
+    // axes[0] from eigen, defended against NaN/zero
+    let a0 = if v0.norm_squared() > 1e-20 {
+        v0.normalize()
+    } else {
+        Vector3::new(0.0, 1.0, 0.0)
+    };
+    // Gram-Schmidt for axes[1] in-plane. If eigen gave a vector parallel
+    // to a0 (happens for repeated eigenvalues / near-zero Q), the
+    // subtraction goes to zero and normalize would return NaN; fall back
+    // to a known-perpendicular helper. Same guard pca_axes uses.
+    let proj = v1 - a0 * a0.dot(&v1);
+    let a1 = if proj.norm_squared() > 1e-20 {
+        proj.normalize()
+    } else {
+        let helper = if a0.x.abs() < 0.9 {
+            Vector3::new(1.0, 0.0, 0.0)
+        } else {
+            Vector3::new(0.0, 1.0, 0.0)
+        };
+        (helper - a0 * a0.dot(&helper)).normalize()
+    };
+    let a2 = a0.cross(&a1).normalize();
+    [a0, a1, a2]
 }
 
 /// Build an orthonormal basis whose first axis is `axis0`, with the other

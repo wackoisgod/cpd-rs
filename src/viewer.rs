@@ -33,15 +33,23 @@ pub fn write_viewer(path: &Path, mesh: &Mesh, prims: &[Primitive]) -> Result<()>
     // primitives
     data.push_str("  \"primitives\": [\n");
     let mut first = true;
+    let mut skipped_nan = 0usize;
     for (pi, p) in prims.iter().enumerate() {
         if !p.alive {
+            continue;
+        }
+        let (verts, tris) = prim::tessellate(&p.prim);
+        // Defensive: NaN / Inf in tessellated verts poisons three.js
+        // BufferGeometry and breaks the entire scene render. Skip those
+        // primitives so the rest of the scene shows up.
+        if verts.iter().any(|v| !v[0].is_finite() || !v[1].is_finite() || !v[2].is_finite()) {
+            skipped_nan += 1;
             continue;
         }
         if !first {
             data.push_str(",\n");
         }
         first = false;
-        let (verts, tris) = prim::tessellate(&p.prim);
         let kind = match p.prim.kind() {
             prim::PrimKind::Obb => "obb",
             prim::PrimKind::Sphere => "sphere",
@@ -75,6 +83,13 @@ pub fn write_viewer(path: &Path, mesh: &Mesh, prims: &[Primitive]) -> Result<()>
     w.write_all(data.as_bytes())?;
     w.write_all(HTML_SUFFIX.as_bytes())?;
     eprintln!("wrote viewer {}", path.display());
+    if skipped_nan > 0 {
+        eprintln!(
+            "  WARNING: skipped {} primitive(s) with NaN tessellation \
+             (likely degenerate fit; investigate upstream)",
+            skipped_nan
+        );
+    }
     Ok(())
 }
 
