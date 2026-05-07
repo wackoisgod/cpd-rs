@@ -631,6 +631,7 @@ pub struct DecompResult {
     pub merges_done: usize,
     pub merges_skipped_stale: usize,
     pub merges_rejected_empty: usize,
+    pub merges_rejected_feasibility: usize,
     pub all_pairs_used: bool,
     pub redundant_culled: usize,
     pub thin_stripped: usize,
@@ -706,6 +707,21 @@ pub struct DecompOpts {
     /// `reject_pancakes`, which penalises the merge during the PQ — this
     /// runs after the merge has fully converged. None disables.
     pub strip_thin_obbs: Option<f32>,
+    /// Merge-time feasibility check. None disables; Some(frac) sets a
+    /// threshold so that any popped-and-realized merge whose resulting
+    /// primitive has local Hausdorff > `frac × mesh_diag` is rejected
+    /// before being committed. The two source primitives stay alive and
+    /// the algorithm picks the next-best PQ candidate.
+    ///
+    /// Targets the failure mode where the cost function
+    /// (V(merge) − V(p0) − V(p1)) is ≈ 0 for two flat coplanar slabs
+    /// merging — the cost can't see surface drift past the input. A
+    /// single such merge produces the "1mm × Nm slab" that dominates
+    /// forward Hausdorff on architecture meshes regardless of N. The
+    /// feasibility check rejects it directly using the metric we care
+    /// about. Cost: BVH nearest-face on ~24 surface samples per
+    /// realized merge.
+    pub feasibility: Option<f32>,
     /// Per-face quadric's tangent-term coefficient (paper §3.4 "Coplanar
     /// Vertices", value `ε`). Default 0.01 stabilises the eigendecomp on
     /// coplanar regions. Setting to 0 makes Q rank-1, leaving in-plane
@@ -766,11 +782,12 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
     let nf = mesh.tris.len();
 
     // Build BVH up-front (needed by exposure / quality / empty-space /
-    // rebalance).
+    // rebalance / feasibility).
     let bvh: Option<Bvh> = if opts.empty_space.is_some()
         || opts.quality_beta > 0.0
         || opts.shell_aware
         || opts.rebalance.is_some()
+        || opts.feasibility.is_some()
     {
         Some(Bvh::build(&mesh.verts, &mesh.tris))
     } else {
@@ -917,6 +934,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
     let mut merges_done = 0usize;
     let mut merges_skipped_stale = 0usize;
     let mut merges_rejected_empty = 0usize;
+    let mut merges_rejected_feasibility = 0usize;
     let mut all_pairs_used = false;
     // Memoize rejected pairs so we don't re-evaluate the BVH for the same
     // pair every time a stale/cheaper entry of theirs gets popped. Key
@@ -1127,6 +1145,23 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         } else {
             (entry.prim, entry.volume, entry.weighted_volume)
         };
+
+        // Merge-time feasibility check. The PQ cost is V(merge) − V(p0) −
+        // V(p1); for two flat coplanar slabs merging, the cost is ≈ 0 even
+        // though the merged primitive's surface drifts metres past the
+        // input. Sample the merged primitive against the input mesh BVH
+        // and reject if the local Hausdorff exceeds the configured
+        // fraction of mesh diag. The two source primitives stay alive,
+        // their other PQ candidates are still in the queue, and the loop
+        // continues with the next-best candidate.
+        if let (Some(frac), Some(bvh_ref)) = (opts.feasibility, &bvh) {
+            let h = local_hausdorff(&new_prim, bvh_ref, mesh);
+            if h > frac * mesh_diag {
+                merges_rejected_feasibility += 1;
+                continue;
+            }
+        }
+
         // O(1) face-list splice (paper §3.4): swap `next` pointers at the
         // two roots to merge the cyclic linked lists into one.
         let tmp = face_next[a];
@@ -1285,6 +1320,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         merges_done,
         merges_skipped_stale,
         merges_rejected_empty,
+        merges_rejected_feasibility,
         all_pairs_used,
         redundant_culled,
         thin_stripped,

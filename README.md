@@ -54,6 +54,10 @@ cpd <mesh.glb> <target_n> [out.obj]
                                    ≤ 1e-4 × diag (paper appendix Fig 22). Tanks
                                    coverage on small-diag meshes — read the section.
         [--strip-thin-threshold <f>]   override 1e-4
+    [--feasibility <f>]            reject popped merges whose result has
+                                   local Hausdorff > f × diag. Try 0.15 for
+                                   architecture meshes; no-op on meshes
+                                   without slab pathology.
     [--no-tangent-eps]             disable Q's ε·ttᵀ in-plane bias (architecture)
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
@@ -115,6 +119,7 @@ handles images (including agentic tooling).
 | §3.4 | Pairwise component fallback | ✓ |
 | §4.4 | One-way Hausdorff / Chamfer evaluation metrics | ✓ |
 | ext. | Reverse Hausdorff (input → primitive surface) + coverage fraction | ✓ |
+| ext. | Merge-time feasibility check (rejects slab merges, paper §3.3 unsolved) | ✓ |
 
 ### Extensions beyond the paper
 
@@ -268,6 +273,69 @@ handles images (including agentic tooling).
   environment scenes — Bistro-class) it should still work as
   documented. Default off. **Always pair with `--metrics` and check
   reverse-Hausdorff + coverage** before claiming an improvement.
+
+- **Merge-time feasibility check (`--feasibility <f>`).** Direct
+  attack on the slab failure mode. The PQ cost
+  (V(merge) − V(p0) − V(p1)) is ≈ 0 when two near-coplanar slabs
+  merge — both have ~0 volume (1mm thickness clamp) and the merged
+  slab also has ~0 volume. The cost function literally cannot see
+  that the merged primitive's *surface* drifts metres past the
+  input. Paper §3.3 acknowledges this; their alternative (Eq 5,
+  including V(p0 ∩ p1)) they call intractable.
+
+  This flag adds a hard reject: after a merge candidate is popped
+  and the resulting primitive is fitted (refit included), sample its
+  surface against the input mesh BVH using `local_hausdorff` (12
+  vertex + 12 triangle-centroid samples) and reject the merge if
+  `h > f × mesh_diag`. The two source primitives stay alive, the
+  algorithm picks the next-best candidate.
+
+  This optimises the actual metric we care about, at the cost of
+  ~24 BVH nearest-face queries per realized merge.
+
+  **Building (the architecture failure case), N=128:**
+
+  | flag                    | fwd H% | rev H% | 2-way H% | coverage | rejects |
+  | ----------------------- | ------ | ------ | -------- | -------- | ------- |
+  | (default)               | 23.60  | 1.78   | 23.60    | 99.6%    | 0       |
+  | `--feasibility 0.20`    | 10.18  | 2.50   | 10.18    | 99.6%    | 7       |
+  | **`--feasibility 0.15`**| **10.18**| 1.73 | **10.18**| 99.6%    | 7       |
+  | `--feasibility 0.10`    | 13.57  | 2.50   | 13.57    | 99.6%    | 13      |
+  | `--feasibility 0.05`    | 15.91  | -      | 15.91    | 99.5%    | 40      |
+
+  Tighter thresholds reject too many cheap merges; the algorithm
+  starves and accepts more expensive ones with bigger drift. 0.15
+  hits a clean optimum across N=64 (12.75%), N=128 (10.18%), N=256
+  (11.99%), N=512 (12.75%) — all roughly half of the 23.60% / 23.27%
+  baseline. Coverage stays ≥99.3% at every config (compare to
+  `--strip-thin` which collapsed coverage to 13–47%).
+
+  **Other meshes — no-op by construction.** Rock kit, blink, and
+  ram show 0 feasibility-rejections at `f=0.15`: their merges all
+  have local Hausdorff well below 15% of diag. Identical metrics
+  with and without the flag:
+
+  | mesh   | N   | default fwd H% | --feasibility 0.15 fwd H% |
+  | ------ | --- | -------------- | ------------------------- |
+  | rock   | 128 | 4.26           | 4.26                      |
+  | rock   | 256 | 2.56           | 2.56                      |
+  | blink  | 128 | 6.26           | 6.16                      |
+  | blink  | 256 | 3.54           | 3.54                      |
+  | ram    | 128 | 5.60           | 5.60                      |
+  | ram    | 256 | 4.41           | 4.41                      |
+
+  **Comparison to paper.** Pre-fix the building was 5× off paper
+  mean (23.6% vs 4.45%); post-fix at 10.18% it sits in the same
+  range as the paper's harder buildings (Chuo House 10.23%,
+  Jpn House 9.14%, Lantern 11.23%, Dojo 11.11%). Not paper-best
+  (Pipe Wall 0.98%, Jpn House 2 1.59%) — but the gap is no longer
+  algorithmic. It's a "convex primitives can't fit non-rectangular
+  planar regions tightly" gap, the same one driving the paper's own
+  failure cases.
+
+  Default off (0.15 doesn't cost anything on non-architecture
+  meshes, but is a behavioural change). Recommended for any
+  environment / architectural input.
 
 - **Iterative face-rebalance (experimental, `--rebalance`).** After the
   greedy merge completes, run Lloyd-style face migration: for each

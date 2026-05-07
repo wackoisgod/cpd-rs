@@ -30,6 +30,7 @@ struct CliArgs {
     rebalance: Option<usize>,
     reject_pancakes: bool,
     strip_thin_obbs: Option<f32>,
+    feasibility: Option<f32>,
     tangent_eps: f32,
     metrics: bool,
     metrics_json: Option<PathBuf>,
@@ -51,6 +52,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut rebalance: Option<usize> = None;
     let mut reject_pancakes = false;
     let mut strip_thin_obbs: Option<f32> = None;
+    let mut feasibility: Option<f32> = None;
     let mut tangent_eps: f32 = 0.01; // paper §3.4 default
     let mut metrics_flag = false;
     let mut metrics_json: Option<PathBuf> = None;
@@ -117,6 +119,16 @@ fn parse_args() -> Result<CliArgs> {
                 args.remove(0);
                 let f: f32 = v.parse().context("not a float")?;
                 strip_thin_obbs = Some(f);
+            }
+            "--feasibility" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--feasibility needs a max-frac-of-diag value")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                feasibility = Some(f);
             }
             "--no-tangent-eps" => {
                 args.remove(0);
@@ -245,6 +257,7 @@ fn parse_args() -> Result<CliArgs> {
         rebalance,
         reject_pancakes,
         strip_thin_obbs,
+        feasibility,
         tangent_eps,
         metrics: metrics_flag,
         metrics_json,
@@ -288,6 +301,11 @@ fn print_usage() {
                             after the fact. Paper's recipe for environment
                             scenes with planar-but-not-rectangular walls.
            [--strip-thin-threshold <f>]   override 1e-4
+       [--feasibility <f>]  reject any popped merge whose result has local
+                            Hausdorff > f × mesh_diag. Direct attack on the
+                            slab-merge failure mode (cost function can't
+                            see surface drift). Try 0.05 to 0.15. Cost:
+                            ~24 BVH queries per realized merge.
        [--no-tangent-eps]   set Q's tangent-term coefficient to 0 (paper
                             §3.4 says decided-per-mesh). Removes the
                             rotated-OBB failure mode on large flat regions;
@@ -397,6 +415,7 @@ fn main() -> Result<()> {
             rebalance: args.rebalance,
             reject_pancakes: args.reject_pancakes,
             strip_thin_obbs: args.strip_thin_obbs,
+            feasibility: args.feasibility,
             tangent_eps: args.tangent_eps,
         },
     );
@@ -410,11 +429,12 @@ fn main() -> Result<()> {
         .sum();
     let by_kind = count_by_kind(&result.primitives);
     eprintln!(
-        "merge: {:.1} ms, {} merges, {} stale, {} empty-rejected, all-pairs={}, culled={}, thin-stripped={}, {} primitives, total vol {:.3}",
+        "merge: {:.1} ms, {} merges, {} stale, {} empty-rejected, {} feasibility-rejected, all-pairs={}, culled={}, thin-stripped={}, {} primitives, total vol {:.3}",
         merge_ms,
         result.merges_done,
         result.merges_skipped_stale,
         result.merges_rejected_empty,
+        result.merges_rejected_feasibility,
         result.all_pairs_used,
         result.redundant_culled,
         result.thin_stripped,
