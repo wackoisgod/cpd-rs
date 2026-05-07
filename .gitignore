@@ -1,0 +1,19 @@
+# Rust build artifacts
+/target
+
+# macOS
+.DS_Store
+
+# Generated decomposition outputs
+*.obj
+*.html
+*.png
+*.json
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Test artifacts
+/tmp/
