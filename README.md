@@ -45,6 +45,7 @@ cpd <mesh.glb> <target_n> [out.obj]
     [--no-cull]                    disable redundant-primitive cull
     [--no-refine]                  disable post-merge orientation refit
     [--quality <beta>]             experimental Hausdorff-aware refit
+    [--shell]                      experimental shell-aware orientation
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
         [--empty-space-distance <frac-of-diag>]   default 0.01
@@ -133,6 +134,36 @@ handles images (including agentic tooling).
   at N=128 (4.26% → 3.74% Hausdorff) but can *worsen* at N=256 because
   greedy refit decisions don't always reduce the global max-Hausdorff.
   Try `--quality 1` to `--quality 5`; default `0` (off).
+
+- **Shell-aware orientation (experimental, `--shell`).** Pre-computes
+  per-face ambient-occlusion exposure: cast 32 stratified rays in each
+  face's outward hemisphere via the BVH and score the fraction
+  unobstructed. Faces below 5% AO are flagged as "interior". The Q
+  matrix gets multiplied by exposure (so interior faces don't bias
+  the area-weighted normal in `axes_from_q`), and PCA / tangent-plane
+  PCA / sharp-edge construction are filtered to shell-only vertices.
+  Containment fits still use every subsumed vertex, so the paper's
+  enclosure guarantee is preserved.
+
+  **Modest gains, mostly at low N.** Detection works correctly
+  (rock kit: 100% shell, blink: 80%, ram-visual: 77%). Measured impact:
+
+  | mesh         | N    | Hausdorff (off→on) | Chamfer (off→on) | volume (off→on) |
+  | ------------ | ---- | ------------------ | ---------------- | --------------- |
+  | rock kit     | 64   | 6.39% → **6.05%**  | 0.67% → 0.65%    | 11.8% → 11.4%   |
+  | rock kit     | 128  | 4.26% (identical)  | 0.343% → 0.337%  | 5.6% (same)     |
+  | blink        | 256  | 4.03% → 4.28%      | 0.44% → 0.46%    | 17.7% → 19.6%   |
+  | ram-visual   | 256  | 7.74% → 8.73%      | 0.96% → 0.95%    | 67.4% → 68.3%   |
+
+  Where it helps (low N on solid meshes), the gain is ~5% Hausdorff
+  reduction. On vehicle meshes where interior is *contained* by the
+  shell hull, the OBB extents are still pinned by shell vertices; what
+  shell-awareness shifts is primitive-type selection (more cylinders,
+  fewer prisms — shell-only Q is more cleanly rank-deficient). That
+  shuffle doesn't reduce worst-case surface drift on those meshes.
+  Where it would shine: scanner data with floating debris, or
+  kitbashed assets with internal geometry poking outside the natural
+  shell hull. The meshes here don't exhibit that.
 
 - **Empty-space preservation (toggleable).** `--empty-space` adds a hard
   reject: sample 27 stratified points inside the candidate primitive's

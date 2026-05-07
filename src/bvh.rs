@@ -70,6 +70,70 @@ impl Bvh {
         }
     }
 
+    /// Any-hit ray query: does any face along the ray within `max_dist`
+    /// intersect? Used for ambient-occlusion-style exposure scoring.
+    pub fn any_hit(
+        &self,
+        verts: &[Point3<f32>],
+        tris: &[[u32; 3]],
+        origin: Point3<f32>,
+        dir: Vector3<f32>,
+        max_dist: f32,
+    ) -> bool {
+        if self.nodes.is_empty() {
+            return false;
+        }
+        // pre-compute reciprocals for the slab test
+        let inv_dir = Vector3::new(
+            if dir.x.abs() > 1e-20 { 1.0 / dir.x } else { f32::INFINITY },
+            if dir.y.abs() > 1e-20 { 1.0 / dir.y } else { f32::INFINITY },
+            if dir.z.abs() > 1e-20 { 1.0 / dir.z } else { f32::INFINITY },
+        );
+        self.descend_ray(0, verts, tris, origin, dir, inv_dir, max_dist)
+    }
+
+    fn descend_ray(
+        &self,
+        node_idx: u32,
+        verts: &[Point3<f32>],
+        tris: &[[u32; 3]],
+        origin: Point3<f32>,
+        dir: Vector3<f32>,
+        inv_dir: Vector3<f32>,
+        max_dist: f32,
+    ) -> bool {
+        let node = &self.nodes[node_idx as usize];
+        if !ray_aabb_hit(&node.aabb_min, &node.aabb_max, &origin, &inv_dir, max_dist) {
+            return false;
+        }
+        if node.count > 0 {
+            // leaf: ray-triangle test for each face
+            let s = node.a as usize;
+            let e = s + node.count as usize;
+            for &fi in &self.face_indices[s..e] {
+                let t = tris[fi as usize];
+                if let Some(d) = ray_triangle(
+                    origin,
+                    dir,
+                    verts[t[0] as usize],
+                    verts[t[1] as usize],
+                    verts[t[2] as usize],
+                ) {
+                    if d > 1e-5 && d <= max_dist {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+        let l = node.a;
+        let r = node.b;
+        if self.descend_ray(l, verts, tris, origin, dir, inv_dir, max_dist) {
+            return true;
+        }
+        self.descend_ray(r, verts, tris, origin, dir, inv_dir, max_dist)
+    }
+
     /// Nearest-face query. Returns (closest_point_on_face, face_normal, signed_distance).
     /// Signed distance is positive when the query is on the side the face normal points
     /// toward (i.e., "outside" by the face's orientation), negative on the back side.
@@ -250,6 +314,68 @@ fn compute_aabb(
         }
     }
     (lo, hi)
+}
+
+/// Standard slab test: does the ray hit the AABB within [0, max_dist]?
+fn ray_aabb_hit(
+    lo: &[f32; 3],
+    hi: &[f32; 3],
+    origin: &Point3<f32>,
+    inv_dir: &Vector3<f32>,
+    max_dist: f32,
+) -> bool {
+    let mut tmin = 0.0f32;
+    let mut tmax = max_dist;
+    for i in 0..3 {
+        let t1 = (lo[i] - origin[i]) * inv_dir[i];
+        let t2 = (hi[i] - origin[i]) * inv_dir[i];
+        let (lo_t, hi_t) = if t1 < t2 { (t1, t2) } else { (t2, t1) };
+        if lo_t > tmin {
+            tmin = lo_t;
+        }
+        if hi_t < tmax {
+            tmax = hi_t;
+        }
+        if tmin > tmax {
+            return false;
+        }
+    }
+    true
+}
+
+/// Möller-Trumbore ray-triangle intersection. Returns the parametric `t`
+/// along the ray to the hit, if any.
+fn ray_triangle(
+    origin: Point3<f32>,
+    dir: Vector3<f32>,
+    a: Point3<f32>,
+    b: Point3<f32>,
+    c: Point3<f32>,
+) -> Option<f32> {
+    let edge1 = b - a;
+    let edge2 = c - a;
+    let h = dir.cross(&edge2);
+    let det = edge1.dot(&h);
+    if det.abs() < 1e-12 {
+        return None; // parallel
+    }
+    let inv_det = 1.0 / det;
+    let s = origin - a;
+    let u = inv_det * s.dot(&h);
+    if !(0.0..=1.0).contains(&u) {
+        return None;
+    }
+    let q = s.cross(&edge1);
+    let v = inv_det * dir.dot(&q);
+    if v < 0.0 || u + v > 1.0 {
+        return None;
+    }
+    let t = inv_det * edge2.dot(&q);
+    if t > 0.0 {
+        Some(t)
+    } else {
+        None
+    }
 }
 
 /// Ericson, "Real-Time Collision Detection". Returns the point on triangle

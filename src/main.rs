@@ -24,6 +24,7 @@ struct CliArgs {
     empty_space: Option<(f32, f32)>, // (max_bridge_fraction, dist_threshold_frac_of_diag)
     refine_orient: bool,
     quality_beta: f32,
+    shell_aware: bool,
     metrics: bool,
     metrics_json: Option<PathBuf>,
 }
@@ -38,6 +39,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut empty_space: Option<(f32, f32)> = None;
     let mut refine_orient = true;
     let mut quality_beta: f32 = 0.0;
+    let mut shell_aware = false;
     let mut metrics_flag = false;
     let mut metrics_json: Option<PathBuf> = None;
     let mut positional: Vec<String> = Vec::new();
@@ -73,6 +75,10 @@ fn parse_args() -> Result<CliArgs> {
                 let v = args.first().cloned().context("--quality needs a beta value")?;
                 args.remove(0);
                 quality_beta = v.parse().context("--quality beta must be f32")?;
+            }
+            "--shell" => {
+                args.remove(0);
+                shell_aware = true;
             }
             "--metrics" => {
                 args.remove(0);
@@ -150,6 +156,7 @@ fn parse_args() -> Result<CliArgs> {
         empty_space,
         refine_orient,
         quality_beta,
+        shell_aware,
         metrics: metrics_flag,
         metrics_json,
     })
@@ -166,6 +173,10 @@ fn print_usage() {
        [--quality <beta>]   Hausdorff-aware refit. Combined cost is
                             volume * (1 + beta * h/diag). Try 0.5–5.0.
                             Lets sphere compete; tightens low-N fits.
+       [--shell]            shell-aware orientation. Pre-computes per-face
+                            ambient-occlusion exposure; weights Q and PCA by
+                            it so interior geometry doesn't bias axes. Best
+                            for kitbashed / scanned assets.
        [--metrics]     compute one-way Hausdorff/Chamfer (paper §4.4) + volume ratio
        [--metrics-json <path>]   also write metrics as JSON to <path>
        [--empty-space]   coarse heuristic — reliably flags large bridges
@@ -255,6 +266,7 @@ fn main() -> Result<()> {
             empty_space,
             refine_orient: args.refine_orient,
             quality_beta: args.quality_beta,
+            shell_aware: args.shell_aware,
         },
     );
     let merge_ms = t2.elapsed().as_secs_f64() * 1000.0;

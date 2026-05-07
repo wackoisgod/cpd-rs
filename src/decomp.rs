@@ -476,6 +476,13 @@ pub struct DecompOpts {
     /// in this mode (it usually loses on raw volume but can win on
     /// Hausdorff for near-spherical regions). 0 disables.
     pub quality_beta: f32,
+    /// Shell-aware orientation. When true, per-face ambient-occlusion
+    /// exposure is computed up-front and used to weight Q (so interior
+    /// faces don't bias the area-weighted normal) and to filter PCA /
+    /// tangent-plane PCA / sharp-edge inputs to outer-shell vertices
+    /// only. Containment fitting still uses every subsumed vertex, so
+    /// the paper's enclosure guarantee is preserved.
+    pub shell_aware: bool,
 }
 
 /// Fraction of stratified-grid samples inside `prim` that are deeper than
@@ -526,12 +533,56 @@ fn empty_space_fraction(
 
 pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
     let nf = mesh.tris.len();
+
+    // Build BVH up-front (needed by exposure / quality / empty-space).
+    let bvh: Option<Bvh> = if opts.empty_space.is_some()
+        || opts.quality_beta > 0.0
+        || opts.shell_aware
+    {
+        Some(Bvh::build(&mesh.verts, &mesh.tris))
+    } else {
+        None
+    };
+    let mesh_diag = crate::mesh::aabb_diag(&mesh.verts).max(1e-6);
+
+    let face_exposure: Option<Vec<f32>> = if opts.shell_aware {
+        let bvh_ref = bvh.as_ref().expect("bvh built when shell_aware");
+        let exp = crate::mesh::compute_face_exposure(mesh, bvh_ref, 32);
+        let n_shell = exp.iter().filter(|&&e| e > 0.05).count();
+        eprintln!(
+            "shell-aware: {} of {} faces are exposed (>5% AO)",
+            n_shell,
+            exp.len()
+        );
+        Some(exp)
+    } else {
+        None
+    };
+    let shell_vertex_mask: Option<Vec<bool>> = face_exposure.as_ref().map(|exp| {
+        let mut mask = vec![false; mesh.verts.len()];
+        for (fi, t) in mesh.tris.iter().enumerate() {
+            if exp[fi] > 0.05 {
+                mask[t[0] as usize] = true;
+                mask[t[1] as usize] = true;
+                mask[t[2] as usize] = true;
+            }
+        }
+        mask
+    });
+
     let mut prims: Vec<Primitive> = Vec::with_capacity(nf);
     for (fi, tri) in mesh.tris.iter().enumerate() {
         let p0 = mesh.verts[tri[0] as usize];
         let p1 = mesh.verts[tri[1] as usize];
         let p2 = mesh.verts[tri[2] as usize];
-        let q = face_quadric(p0, p1, p2);
+        // Q is linear in face area, so multiplying the per-face quadric
+        // by exposure simply down-weights interior faces in any later
+        // Q_a + Q_b sum during merging.
+        let q_unit = face_quadric(p0, p1, p2);
+        let q = match &face_exposure {
+            Some(exp) => q_unit * exp[fi],
+            None => q_unit,
+        };
         let axes = axes_from_q(q);
         let mut vidx = [tri[0], tri[1], tri[2]];
         vidx.sort();
@@ -559,20 +610,22 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
     // detection on PQ pop.
     let mut dsu = Dsu::new(nf);
 
-    // Build the BVH if any feature that needs it is on (empty-space or
-    // Hausdorff-aware quality refit).
-    let bvh: Option<Bvh> = if opts.empty_space.is_some() || opts.quality_beta > 0.0 {
-        Some(Bvh::build(&mesh.verts, &mesh.tris))
-    } else {
-        None
-    };
-    let mesh_diag = crate::mesh::aabb_diag(&mesh.verts).max(1e-6);
 
     // Pre-compute sharp edges if orientation refinement is on. ~30° dihedral
     // threshold catches creases on architecture/CAD-style meshes without
     // false-flagging slightly-curved smooth surfaces.
     let sharp_edges: Option<SharpEdges> = if opts.refine_orient {
-        Some(crate::mesh::build_sharp_edges(mesh, std::f32::consts::FRAC_PI_6))
+        // Build a shell-only face mask if shell-aware is on, so creases
+        // between two interior faces don't pollute the sharp-edge axes.
+        let face_shell_mask: Option<Vec<bool>> = face_exposure.as_ref().map(|exp| {
+            exp.iter().map(|&e| e > 0.05).collect()
+        });
+        let mask_ref = face_shell_mask.as_deref();
+        Some(crate::mesh::build_sharp_edges(
+            mesh,
+            std::f32::consts::FRAC_PI_6,
+            mask_ref,
+        ))
     } else {
         None
     };
@@ -704,10 +757,28 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         // can only equal-or-improve the cached primitive — no need to
         // re-push the candidate to the priority queue.
         let (new_prim, new_vol, new_wvol) = if opts.refine_orient {
+            // Containment fits use every subsumed vertex (paper guarantee).
             let pts: Vec<Point3<f32>> = new_vidx
                 .iter()
                 .map(|&i| mesh.verts[i as usize])
                 .collect();
+            // Orientation fits prefer shell vertices when shell-awareness
+            // is on. Fall back to the full set if too few shell verts.
+            let pts_orient: Vec<Point3<f32>> = match &shell_vertex_mask {
+                Some(mask) => {
+                    let v: Vec<Point3<f32>> = new_vidx
+                        .iter()
+                        .filter(|&&i| mask[i as usize])
+                        .map(|&i| mesh.verts[i as usize])
+                        .collect();
+                    if v.len() < 4 {
+                        pts.clone()
+                    } else {
+                        v
+                    }
+                }
+                None => pts.clone(),
+            };
 
             // Selection criterion: when quality_beta == 0, just minimise
             // weighted volume (paper-faithful). When > 0, minimise
@@ -757,10 +828,10 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                 }
             };
 
-            // Candidate 1: vertex PCA.
-            try_axes(pca_axes(&pts), &mut best_prim, &mut best_score);
-            // Candidate 2: tangent-plane PCA.
-            try_axes(tangent_plane_pca_axes(new_q, &pts), &mut best_prim, &mut best_score);
+            // Candidate 1: vertex PCA (shell-only when shell-aware is on).
+            try_axes(pca_axes(&pts_orient), &mut best_prim, &mut best_score);
+            // Candidate 2: tangent-plane PCA (shell-only when on).
+            try_axes(tangent_plane_pca_axes(new_q, &pts_orient), &mut best_prim, &mut best_score);
             // Candidate 3: sharp-edge directions.
             if let Some(sharp_ref) = &sharp_edges {
                 let face_iter = walk_faces(a as u32, prims[a].face_count, &face_next)

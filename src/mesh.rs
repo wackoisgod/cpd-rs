@@ -151,6 +151,77 @@ pub fn build_adjacency(tris: &[[u32; 3]]) -> Adjacency {
     Adjacency { neighbors }
 }
 
+/// Per-face ambient-occlusion-style exposure score in [0, 1].
+/// 1.0 = face is unobstructed (clear sky in its outward hemisphere).
+/// 0.0 = face is buried in mesh interior (every outward direction blocked).
+///
+/// Used by the shell-aware orientation refinement: interior geometry on
+/// kitbashed/scanned assets pollutes the area-weighted normal quadric and
+/// PCA. Down-weighting buried faces in Q and filtering them out of PCA
+/// makes the orientation reflect the visible shell, while containment
+/// fitting still uses every subsumed vertex (paper enclosure guarantee).
+pub fn compute_face_exposure(
+    mesh: &Mesh,
+    bvh: &crate::bvh::Bvh,
+    n_dirs: usize,
+) -> Vec<f32> {
+    let nf = mesh.tris.len();
+    let diag = aabb_diag(&mesh.verts).max(1.0);
+    let max_dist = diag * 0.5;
+    let eps_offset = diag * 1e-4;
+
+    // Stratified directions on the unit sphere via Fibonacci spiral.
+    let golden = std::f32::consts::PI * (3.0 - (5.0_f32).sqrt());
+    let dirs: Vec<Vector3<f32>> = (0..n_dirs)
+        .map(|i| {
+            let z = 1.0 - 2.0 * (i as f32 + 0.5) / n_dirs as f32;
+            let r = (1.0 - z * z).max(0.0).sqrt();
+            let theta = golden * i as f32;
+            Vector3::new(r * theta.cos(), r * theta.sin(), z)
+        })
+        .collect();
+
+    use rayon::prelude::*;
+    (0..nf)
+        .into_par_iter()
+        .map(|fi| {
+            let t = mesh.tris[fi];
+            let a = mesh.verts[t[0] as usize];
+            let b = mesh.verts[t[1] as usize];
+            let c = mesh.verts[t[2] as usize];
+            let centroid = Point3::from((a.coords + b.coords + c.coords) / 3.0);
+            let n = (b - a).cross(&(c - a));
+            let n_len2 = n.norm_squared();
+            if n_len2 < 1e-20 {
+                return 0.5;
+            }
+            let normal = n / n_len2.sqrt();
+            // Origin slightly above the face along its normal so we don't
+            // self-intersect with the source face.
+            let origin = centroid + normal * eps_offset;
+            let mut total = 0u32;
+            let mut exposed = 0u32;
+            for d in &dirs {
+                let cosang = d.dot(&normal);
+                // Only sample the +normal hemisphere — interior side
+                // exposure isn't relevant.
+                if cosang <= 0.0 {
+                    continue;
+                }
+                total += 1;
+                if !bvh.any_hit(&mesh.verts, &mesh.tris, origin, *d, max_dist) {
+                    exposed += 1;
+                }
+            }
+            if total == 0 {
+                0.5
+            } else {
+                exposed as f32 / total as f32
+            }
+        })
+        .collect()
+}
+
 /// Per-mesh detection of "sharp" feature edges: edges whose two incident
 /// faces meet at a dihedral angle above some threshold (i.e., a crease).
 /// The directions of these edges are useful as a third orientation
@@ -161,7 +232,11 @@ pub struct SharpEdges {
     pub per_face: Vec<Vec<Vector3<f32>>>,
 }
 
-pub fn build_sharp_edges(mesh: &Mesh, dihedral_threshold_rad: f32) -> SharpEdges {
+pub fn build_sharp_edges(
+    mesh: &Mesh,
+    dihedral_threshold_rad: f32,
+    face_shell_mask: Option<&[bool]>,
+) -> SharpEdges {
     let nf = mesh.tris.len();
     let face_normals: Vec<Vector3<f32>> = mesh
         .tris
@@ -192,6 +267,14 @@ pub fn build_sharp_edges(mesh: &Mesh, dihedral_threshold_rad: f32) -> SharpEdges
     for (key, faces) in &edge_to_faces {
         if faces.len() != 2 {
             continue; // boundary or non-manifold edge — treat as not sharp
+        }
+        // When shell-mask is provided, skip edges with any interior face —
+        // creases between two interior faces aren't features we want to
+        // align primitives to.
+        if let Some(mask) = face_shell_mask {
+            if !mask[faces[0] as usize] || !mask[faces[1] as usize] {
+                continue;
+            }
         }
         let n0 = &face_normals[faces[0] as usize];
         let n1 = &face_normals[faces[1] as usize];
