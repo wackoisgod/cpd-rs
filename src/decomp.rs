@@ -7,9 +7,8 @@ use rayon::prelude::*;
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 
-const TANGENT_EPS: f32 = 0.01;
 
-pub fn face_quadric(p0: Point3<f32>, p1: Point3<f32>, p2: Point3<f32>) -> Matrix3<f32> {
+pub fn face_quadric(p0: Point3<f32>, p1: Point3<f32>, p2: Point3<f32>, tangent_eps: f32) -> Matrix3<f32> {
     let e0 = p1 - p0;
     let e1 = p2 - p1;
     let e2 = p0 - p2;
@@ -20,6 +19,18 @@ pub fn face_quadric(p0: Point3<f32>, p1: Point3<f32>, p2: Point3<f32>) -> Matrix
     }
     let area = 0.5 * area2;
     let n = cross / area2;
+
+    // The tangent term is the paper's per-mesh-decided knob (§3.4). At
+    // ε=0 only the normal contributes — Q is strictly rank-1 for a
+    // single face. The rank-1 case hands all in-plane axis decisions to
+    // our PCA / tangent-plane / sharp-edge fallbacks. At ε>0 we
+    // pre-bias the in-plane axes to whatever Gram-Schmidt of (n, t)
+    // produces, which on big flat regions can rotate the OBB by an
+    // arbitrary amount and produce a rotated slab that drifts past the
+    // mesh corners. Caller decides via DecompOpts.tangent_eps.
+    if tangent_eps <= 0.0 {
+        return area * (n * n.transpose());
+    }
 
     // Quad-aware tangent (paper §3.4 "Coplanar Vertices"). Sort the three
     // edges by length; treat the longest as if it were a quad's diagonal,
@@ -53,7 +64,7 @@ pub fn face_quadric(p0: Point3<f32>, p1: Point3<f32>, p2: Point3<f32>) -> Matrix
         }
     };
 
-    area * (n * n.transpose() + TANGENT_EPS * t * t.transpose())
+    area * (n * n.transpose() + tangent_eps * t * t.transpose())
 }
 
 pub fn axes_from_q(q: Matrix3<f32>) -> [Vector3<f32>; 3] {
@@ -683,6 +694,14 @@ pub struct DecompOpts {
     /// building) but can regress vehicles whose long-narrow panels fall
     /// on the same side of the threshold (blink: +75% Hausdorff).
     pub reject_pancakes: bool,
+    /// Per-face quadric's tangent-term coefficient (paper §3.4 "Coplanar
+    /// Vertices", value `ε`). Default 0.01 stabilises the eigendecomp on
+    /// coplanar regions. Setting to 0 makes Q rank-1, leaving in-plane
+    /// orientation entirely to the refit's PCA/tangent-plane/sharp-edge
+    /// candidates. The paper notes this is decided per-mesh; on
+    /// architecture meshes with large flat surfaces, ε=0 can avoid the
+    /// rotated-slab failure mode.
+    pub tangent_eps: f32,
 }
 
 /// Fraction of stratified-grid samples inside `prim` that are deeper than
@@ -780,7 +799,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         // Q is linear in face area, so multiplying the per-face quadric
         // by exposure simply down-weights interior faces in any later
         // Q_a + Q_b sum during merging.
-        let q_unit = face_quadric(p0, p1, p2);
+        let q_unit = face_quadric(p0, p1, p2, opts.tangent_eps);
         let q = match &face_exposure {
             Some(exp) => q_unit * exp[fi],
             None => q_unit,
@@ -1229,6 +1248,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                 bvh_ref,
                 opts.enabled,
                 max_passes,
+                opts.tangent_eps,
             );
             eprintln!(
                 "rebalance: {} total face moves in {:.1} ms",
@@ -1274,6 +1294,7 @@ fn refit_from_faces(
     mesh: &Mesh,
     enabled: PrimMask,
     bvh: &Bvh,
+    tangent_eps: f32,
 ) -> RebalanceState {
     // Sum per-face quadrics, gather subsumed vertices.
     let mut q = Matrix3::zeros();
@@ -1283,7 +1304,7 @@ fn refit_from_faces(
         let p0 = mesh.verts[t[0] as usize];
         let p1 = mesh.verts[t[1] as usize];
         let p2 = mesh.verts[t[2] as usize];
-        q += face_quadric(p0, p1, p2);
+        q += face_quadric(p0, p1, p2, tangent_eps);
         vidx_set.insert(t[0]);
         vidx_set.insert(t[1]);
         vidx_set.insert(t[2]);
@@ -1319,6 +1340,7 @@ fn rebalance_faces(
     bvh: &Bvh,
     enabled: PrimMask,
     max_passes: usize,
+    tangent_eps: f32,
 ) -> usize {
     // Combined cost so we don't accept moves that improve Hausdorff at
     // catastrophic volume cost. Same shape as --quality.
@@ -1358,7 +1380,7 @@ fn rebalance_faces(
     // to be tracked (the greedy pass had its own per-primitive state, but
     // for migration we want a single source of truth).
     let mut state: Vec<RebalanceState> = (0..n_prims)
-        .map(|pid| refit_from_faces(&prim_faces[pid], mesh, enabled, bvh))
+        .map(|pid| refit_from_faces(&prim_faces[pid], mesh, enabled, bvh, tangent_eps))
         .collect();
 
     let mut total_moves = 0usize;
@@ -1402,8 +1424,8 @@ fn rebalance_faces(
                 let mut new_b_faces = prim_faces[cand_p].clone();
                 new_b_faces.push(f as u32);
 
-                let new_a = refit_from_faces(&new_a_faces, mesh, enabled, bvh);
-                let new_b = refit_from_faces(&new_b_faces, mesh, enabled, bvh);
+                let new_a = refit_from_faces(&new_a_faces, mesh, enabled, bvh, tangent_eps);
+                let new_b = refit_from_faces(&new_b_faces, mesh, enabled, bvh, tangent_eps);
                 let new_combined = score_state(&new_a) + score_state(&new_b);
                 let delta = new_combined - old_combined;
                 if delta < best_delta {

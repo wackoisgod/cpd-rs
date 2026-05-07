@@ -29,6 +29,7 @@ struct CliArgs {
     weighted_cost: bool,
     rebalance: Option<usize>,
     reject_pancakes: bool,
+    tangent_eps: f32,
     metrics: bool,
     metrics_json: Option<PathBuf>,
 }
@@ -48,6 +49,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut weighted_cost = false;
     let mut rebalance: Option<usize> = None;
     let mut reject_pancakes = false;
+    let mut tangent_eps: f32 = 0.01; // paper §3.4 default
     let mut metrics_flag = false;
     let mut metrics_json: Option<PathBuf> = None;
     let mut positional: Vec<String> = Vec::new();
@@ -99,6 +101,16 @@ fn parse_args() -> Result<CliArgs> {
             "--reject-pancakes" => {
                 args.remove(0);
                 reject_pancakes = true;
+            }
+            "--no-tangent-eps" => {
+                args.remove(0);
+                tangent_eps = 0.0;
+            }
+            "--tangent-eps" => {
+                args.remove(0);
+                let v = args.first().cloned().context("--tangent-eps needs f32")?;
+                args.remove(0);
+                tangent_eps = v.parse().context("not a float")?;
             }
             "--rebalance-passes" => {
                 args.remove(0);
@@ -216,6 +228,7 @@ fn parse_args() -> Result<CliArgs> {
         weighted_cost,
         rebalance,
         reject_pancakes,
+        tangent_eps,
         metrics: metrics_flag,
         metrics_json,
     })
@@ -250,6 +263,12 @@ fn print_usage() {
                             architecture meshes with rooftops / wall
                             collisions; can hurt vehicles with long thin
                             panels at the same threshold.
+       [--no-tangent-eps]   set Q's tangent-term coefficient to 0 (paper
+                            §3.4 says decided-per-mesh). Removes the
+                            rotated-OBB failure mode on large flat regions;
+                            can hurt meshes that depend on the eigendecomp's
+                            in-plane stabilisation (vehicles, organic).
+       [--tangent-eps <e>]  override default 0.01 with custom ε.
        [--proximity]        spatial-proximity merges between disconnected
                             components. Adds candidate edges between nearby
                             components in the initial PQ, with cost ordering
@@ -352,6 +371,7 @@ fn main() -> Result<()> {
             weighted_cost: args.weighted_cost,
             rebalance: args.rebalance,
             reject_pancakes: args.reject_pancakes,
+            tangent_eps: args.tangent_eps,
         },
     );
     let merge_ms = t2.elapsed().as_secs_f64() * 1000.0;

@@ -50,6 +50,7 @@ cpd <mesh.glb> <target_n> [out.obj]
     [--weighted-cost]              PQ ordering uses weighted volume (organic-friendly)
     [--rebalance]                  Lloyd-style face migration after greedy (experimental)
     [--reject-pancakes]            penalise 1mm × N-metre slab merges (architecture)
+    [--no-tangent-eps]             disable Q's ε·ttᵀ in-plane bias (architecture)
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
         [--empty-space-distance <frac-of-diag>]   default 0.01
@@ -163,6 +164,38 @@ handles images (including agentic tooling).
   But on detail-heavy meshes the effect reverses (blink N=128: 5.04%
   → 6.72%; ram-visual N=256: 7.74% → 8.54%). Default off; turn on
   for organic / near-convex inputs (rocks, terrain, sculpted props).
+
+- **Tangent-term knob (`--no-tangent-eps` / `--tangent-eps <ε>`).** The
+  per-face quadric is `Q = area · (n nᵀ + ε · t tᵀ)` (paper §3.4
+  "Coplanar Vertices"). The ε·ttᵀ term stabilises the eigendecomp on
+  flat regions by giving Q a non-zero in-plane component. Default
+  ε=0.01 matches the paper. The paper itself notes:
+
+  > "We decide per mesh whether to include this factor."
+
+  At ε=0, Q is rank-1 for a single face; in-plane axis decisions are
+  handed entirely to the refit pass (PCA / tangent-plane PCA /
+  sharp-edge). This **removes the rotated-OBB failure mode on
+  large flat regions** — the worst primitive on our test building goes
+  from 60°-rotated axes (slab corners drift past the rooftop) to
+  world-axis-aligned axes. But it costs vehicle/organic meshes some
+  numerical stability, so it's opt-in.
+
+  Measured impact:
+
+  | mesh                    | N    | default (ε=0.01) | --no-tangent-eps |
+  | ----------------------- | ---- | ---------------- | ---------------- |
+  | building (architecture) | 64   | 23.60% Hausdorff | **19.97%** (-15%)|
+  | building                | 128  | 23.60%           | **21.07%** (-11%)|
+  | rock kit                | 64   | 6.39%            | 7.22% (+13%)     |
+  | blink-visual            | 128  | 5.04%            | 7.33% (+46%)     |
+  | ram-visual              | 256  | 8.54%            | 9.13% (+7%)      |
+
+  **Architecture combo:** `--no-tangent-eps --reject-pancakes
+  --empty-space --empty-space-fraction 0.10` on the test building
+  drops Hausdorff from 23.60% → **14.54%** at N=64 (-38%) and is
+  visually much cleaner (primitive footprint matches building outline
+  on top/bottom views, no slab pancakes protruding past silhouette).
 
 - **Pancake-merge penalty (`--reject-pancakes`).** Multiplies the merge
   cost by 1000 when the resulting primitive's smallest half-extent has
