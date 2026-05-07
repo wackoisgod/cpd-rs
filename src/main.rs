@@ -29,6 +29,7 @@ struct CliArgs {
     weighted_cost: bool,
     rebalance: Option<usize>,
     reject_pancakes: bool,
+    strip_thin_obbs: Option<f32>,
     tangent_eps: f32,
     metrics: bool,
     metrics_json: Option<PathBuf>,
@@ -49,6 +50,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut weighted_cost = false;
     let mut rebalance: Option<usize> = None;
     let mut reject_pancakes = false;
+    let mut strip_thin_obbs: Option<f32> = None;
     let mut tangent_eps: f32 = 0.01; // paper §3.4 default
     let mut metrics_flag = false;
     let mut metrics_json: Option<PathBuf> = None;
@@ -101,6 +103,20 @@ fn parse_args() -> Result<CliArgs> {
             "--reject-pancakes" => {
                 args.remove(0);
                 reject_pancakes = true;
+            }
+            "--strip-thin" => {
+                args.remove(0);
+                strip_thin_obbs = Some(strip_thin_obbs.unwrap_or(1e-4));
+            }
+            "--strip-thin-threshold" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--strip-thin-threshold needs f32")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                strip_thin_obbs = Some(f);
             }
             "--no-tangent-eps" => {
                 args.remove(0);
@@ -228,6 +244,7 @@ fn parse_args() -> Result<CliArgs> {
         weighted_cost,
         rebalance,
         reject_pancakes,
+        strip_thin_obbs,
         tangent_eps,
         metrics: metrics_flag,
         metrics_json,
@@ -263,6 +280,14 @@ fn print_usage() {
                             architecture meshes with rooftops / wall
                             collisions; can hurt vehicles with long thin
                             panels at the same threshold.
+       [--strip-thin]       paper appendix Fig 22 postprocess: after merge
+                            + cull, delete any OBB whose smallest half-
+                            extent ≤ 1e-4 × mesh_diag. Different from
+                            --reject-pancakes (which fights the merge);
+                            this lets the merge converge then strips slabs
+                            after the fact. Paper's recipe for environment
+                            scenes with planar-but-not-rectangular walls.
+           [--strip-thin-threshold <f>]   override 1e-4
        [--no-tangent-eps]   set Q's tangent-term coefficient to 0 (paper
                             §3.4 says decided-per-mesh). Removes the
                             rotated-OBB failure mode on large flat regions;
@@ -371,6 +396,7 @@ fn main() -> Result<()> {
             weighted_cost: args.weighted_cost,
             rebalance: args.rebalance,
             reject_pancakes: args.reject_pancakes,
+            strip_thin_obbs: args.strip_thin_obbs,
             tangent_eps: args.tangent_eps,
         },
     );
@@ -384,13 +410,14 @@ fn main() -> Result<()> {
         .sum();
     let by_kind = count_by_kind(&result.primitives);
     eprintln!(
-        "merge: {:.1} ms, {} merges, {} stale, {} empty-rejected, all-pairs={}, culled={}, {} primitives, total vol {:.3}",
+        "merge: {:.1} ms, {} merges, {} stale, {} empty-rejected, all-pairs={}, culled={}, thin-stripped={}, {} primitives, total vol {:.3}",
         merge_ms,
         result.merges_done,
         result.merges_skipped_stale,
         result.merges_rejected_empty,
         result.all_pairs_used,
         result.redundant_culled,
+        result.thin_stripped,
         alive,
         total_vol,
     );

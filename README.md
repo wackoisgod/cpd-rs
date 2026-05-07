@@ -50,6 +50,10 @@ cpd <mesh.glb> <target_n> [out.obj]
     [--weighted-cost]              PQ ordering uses weighted volume (organic-friendly)
     [--rebalance]                  Lloyd-style face migration after greedy (experimental)
     [--reject-pancakes]            penalise 1mm × N-metre slab merges (architecture)
+    [--strip-thin]                 postprocess: delete OBBs with min half-extent
+                                   ≤ 1e-4 × diag (paper appendix Fig 22). Tanks
+                                   coverage on small-diag meshes — read the section.
+        [--strip-thin-threshold <f>]   override 1e-4
     [--no-tangent-eps]             disable Q's ε·ttᵀ in-plane bias (architecture)
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
@@ -110,6 +114,7 @@ handles images (including agentic tooling).
 | §3.4 | DSU + cyclic linked list face bookkeeping | ✓ |
 | §3.4 | Pairwise component fallback | ✓ |
 | §4.4 | One-way Hausdorff / Chamfer evaluation metrics | ✓ |
+| ext. | Reverse Hausdorff (input → primitive surface) + coverage fraction | ✓ |
 
 ### Extensions beyond the paper
 
@@ -221,6 +226,48 @@ handles images (including agentic tooling).
   same threshold can regress (blink: +75% Hausdorff). Default off; opt
   in for buildings / architecture / environment art with prominent
   flat collisions.
+
+- **Postprocess thin-OBB strip (`--strip-thin`).** Paper appendix
+  Fig 22 (Bistro scene) recipe: after the merge + redundant cull
+  complete, delete every OBB whose smallest half-extent is
+  ≤ `1e-4 × mesh_diag`. Override the fraction with
+  `--strip-thin-threshold <f>`. The paper uses this to clean up
+  "many walls are entirely planar but may not be rectangular,
+  leading to regions jutting out" — the slab failure mode. Distinct
+  from `--reject-pancakes`: this lets the merge fully converge,
+  *then* deletes slabs as a postprocess.
+
+  **The headline numbers look great. They lie.** On the test
+  building it cuts forward Hausdorff from 23.6% → 4.5% at N=128 —
+  paper-territory. But the forward (paper §4.4) Hausdorff measures
+  primitive-surface drift past the input only; it does not penalise
+  *uncovered input*. Strip too aggressively and you delete
+  legitimate surface-fitted primitives. Forward Hausdorff stays
+  low (the surviving primitives sit on the input), but coverage
+  collapses. The reverse Hausdorff and coverage-fraction metrics
+  added to `--metrics` expose this honestly:
+  
+  | N    | mode    | fwd H% | rev H%  | 2-way H% | coverage |
+  | ---- | ------- | ------ | ------- | -------- | -------- |
+  | 128  | default | 23.60  | 1.78    | 23.60    | **99.6%**|
+  | 128  | strip   | 4.47   | 17.07   | 17.07    | **46.8%**|
+  | 256  | default | 23.60  | 0.82    | 23.60    | **99.3%**|
+  | 256  | strip   | 4.78   | 24.98   | 24.98    | **24.8%**|
+  | 512  | strip   | 4.22   | 26.70   | 26.70    | **13.3%**|
+
+  At N=512, `--strip-thin` deletes ~75% of primitives; the surviving
+  225 cover only 13% of the input. By the symmetric 2-way metric,
+  strip is *worse* than baseline at every N. Why the paper gets away
+  with it on Bistro: their mesh diag is so much larger that the
+  `1e-4` threshold (~5cm in absolute terms) sits below real wall
+  thickness. On our 69m-diag building, `1e-4` is 6.9mm — most
+  legitimate surface fits clamp to ≤1mm and get deleted.
+
+  Kept as an option so you can reproduce the paper's recipe, and
+  because on meshes with large diag and thick walls (true
+  environment scenes — Bistro-class) it should still work as
+  documented. Default off. **Always pair with `--metrics` and check
+  reverse-Hausdorff + coverage** before claiming an improvement.
 
 - **Iterative face-rebalance (experimental, `--rebalance`).** After the
   greedy merge completes, run Lloyd-style face migration: for each
@@ -334,8 +381,25 @@ handles images (including agentic tooling).
   disk wins selection despite extending far beyond the cloud. We skip
   axes whose axial extent is < 5% of the largest axial extent.
 
-- **Self-evaluation loop.** `--metrics` computes paper-§4.4 distances
-  against the input mesh via a BVH-accelerated nearest-face query.
+- **Self-evaluation loop.** `--metrics` computes:
+  - **Forward Hausdorff/Chamfer** (paper §4.4): primitive surface →
+    input mesh, via the input-mesh BVH. Penalises primitives that
+    drift past the input.
+  - **Reverse Hausdorff/Chamfer** (extension): input mesh → nearest
+    primitive surface, via a BVH built over the union of all live
+    primitive tessellations. Penalises uncovered input.
+  - **2-way Hausdorff** (max of fwd and rev): the standard
+    symmetric metric — the single honest number to compare runs.
+  - **Coverage fraction**: fraction of input-mesh samples that lie
+    inside *some* live primitive's volume. Direct collision-detection
+    proxy. 1.0 = every input point covered.
+
+  Forward Hausdorff alone can be fooled by deleting primitives — see
+  the `--strip-thin` writeup above for a worked example. Always
+  cross-check against reverse + coverage before trusting an
+  optimisation that drops forward Hausdorff but also drops primitive
+  count.
+
   `scripts/screenshot.sh` headlessly renders the viewer to PNG so an
   agent can visually validate without a GUI.
 

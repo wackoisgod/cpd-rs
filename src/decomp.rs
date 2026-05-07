@@ -633,6 +633,7 @@ pub struct DecompResult {
     pub merges_rejected_empty: usize,
     pub all_pairs_used: bool,
     pub redundant_culled: usize,
+    pub thin_stripped: usize,
     pub rebalance_moves: usize,
 }
 
@@ -694,6 +695,17 @@ pub struct DecompOpts {
     /// building) but can regress vehicles whose long-narrow panels fall
     /// on the same side of the threshold (blink: +75% Hausdorff).
     pub reject_pancakes: bool,
+    /// Postprocess thin-OBB removal (paper appendix Fig 22, the Bistro
+    /// scene). After the merge + redundant cull complete, delete any OBB
+    /// whose smallest half-extent is ≤ `threshold_frac × mesh_diag`. The
+    /// paper uses 1e-4 of the mesh diagonal. Targets the "many walls are
+    /// entirely planar but may not be rectangular, leading to regions
+    /// jutting out" failure mode: the merge produces a slab whose surface
+    /// drifts metres past the actual outline; deleting that slab leaves
+    /// the underlying smaller primitives in place. Different from
+    /// `reject_pancakes`, which penalises the merge during the PQ — this
+    /// runs after the merge has fully converged. None disables.
+    pub strip_thin_obbs: Option<f32>,
     /// Per-face quadric's tangent-term coefficient (paper §3.4 "Coplanar
     /// Vertices", value `ε`). Default 0.01 stabilises the eigendecomp on
     /// coplanar regions. Setting to 0 makes Q rank-1, leaving in-plane
@@ -1263,6 +1275,11 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         redundant_culled = cull_redundant(&mut prims, &mesh.verts);
     }
 
+    let thin_stripped = match opts.strip_thin_obbs {
+        Some(frac) => strip_thin_obbs(&mut prims, &mesh.verts, frac),
+        None => 0,
+    };
+
     DecompResult {
         primitives: prims,
         merges_done,
@@ -1270,6 +1287,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         merges_rejected_empty,
         all_pairs_used,
         redundant_culled,
+        thin_stripped,
         rebalance_moves,
     }
 }
@@ -1575,6 +1593,57 @@ fn cull_redundant(prims: &mut [Primitive], mesh_verts: &[Point3<f32>]) -> usize 
         prims[*i].alive = false;
     }
     to_drop.len()
+}
+
+/// Paper appendix Fig 22 postprocess: drop OBBs whose smallest half-extent
+/// is ≤ `threshold_frac × mesh_diag`. The paper's Bistro recipe is
+/// `threshold_frac = 1e-4`. Distinct from `is_pancake` (which is a
+/// merge-time penalty keyed off the MIN_HALF_EXTENT clamp): this runs
+/// after the merge fully converges and uses an absolute fraction of the
+/// mesh diag, catching slabs that didn't quite hit the clamp but still
+/// have surface drifting many metres from the input. OBBs only — Prisms
+/// can have legitimately tiny `hzt` (gable roof tip), capsules with tiny
+/// radius are valid cables, etc.
+fn strip_thin_obbs(
+    prims: &mut [Primitive],
+    mesh_verts: &[Point3<f32>],
+    threshold_frac: f32,
+) -> usize {
+    if mesh_verts.is_empty() || threshold_frac <= 0.0 {
+        return 0;
+    }
+    let mut lo = [f32::INFINITY; 3];
+    let mut hi = [f32::NEG_INFINITY; 3];
+    for v in mesh_verts {
+        for i in 0..3 {
+            if v[i] < lo[i] {
+                lo[i] = v[i];
+            }
+            if v[i] > hi[i] {
+                hi[i] = v[i];
+            }
+        }
+    }
+    let dx = hi[0] - lo[0];
+    let dy = hi[1] - lo[1];
+    let dz = hi[2] - lo[2];
+    let diag = (dx * dx + dy * dy + dz * dz).sqrt();
+    let tol = (diag.max(1.0)) * threshold_frac;
+
+    let mut dropped = 0usize;
+    for p in prims.iter_mut() {
+        if !p.alive {
+            continue;
+        }
+        if let Prim::Obb { half_extents, .. } = &p.prim {
+            let min_h = half_extents[0].min(half_extents[1]).min(half_extents[2]);
+            if min_h <= tol {
+                p.alive = false;
+                dropped += 1;
+            }
+        }
+    }
+    dropped
 }
 
 fn shared_vertex(a: &[u32], b: &[u32]) -> bool {
