@@ -55,6 +55,60 @@ pub enum Prim {
 }
 
 impl Prim {
+    /// True if the fit is "pancake degenerate": the smallest dimension
+    /// has clamped to MIN_HALF_EXTENT *and* the largest dimension is much
+    /// bigger. These arise when many near-coplanar faces from disparate
+    /// parts of a mesh get merged into a single primitive whose
+    /// thickness collapses to the clamp — surface area is metres but
+    /// only a tiny fraction overlaps actual input geometry. We require
+    /// the clamp condition (not just an aspect ratio) so legitimate
+    /// thin features (e.g. a real 5mm-thick wall) aren't rejected.
+    pub fn is_pancake(&self) -> bool {
+        // Min-dim has to be sitting *at* the half-extent clamp (we leave
+        // a 1.5× buffer to absorb any float noise from the fit code) and
+        // the primitive must extend at least 1000× further in some other
+        // direction before we call it a pancake. Looser thresholds (e.g.
+        // 0.01) caught legitimate thin features like 1mm vehicle panels
+        // and inflated their parent merge tree.
+        const CLAMP_BUFFER: f32 = 1.5;
+        const ASPECT: f32 = 0.001;
+        let clamped = MIN_HALF_EXTENT * CLAMP_BUFFER;
+        match *self {
+            Prim::Obb { half_extents, .. } => {
+                let min_h = half_extents[0].min(half_extents[1]).min(half_extents[2]);
+                let max_h = half_extents[0].max(half_extents[1]).max(half_extents[2]);
+                min_h < clamped && max_h > 0.0 && min_h / max_h < ASPECT
+            }
+            Prim::Prism {
+                hx,
+                hy,
+                hzt,
+                hzb,
+                ..
+            } => {
+                let dims = [hx, hy, hzt, hzb];
+                let min_h = dims.iter().cloned().fold(f32::INFINITY, f32::min);
+                let max_h = dims.iter().cloned().fold(0.0f32, f32::max);
+                min_h < clamped && max_h > 0.0 && min_h / max_h < ASPECT
+            }
+            Prim::Cylinder { h, r, .. } | Prim::Capsule { h, r, .. } => {
+                let max_d = h.max(r * 2.0);
+                let min_d = h.min(r * 2.0);
+                min_d < clamped && max_d > 0.0 && min_d / max_d < ASPECT
+            }
+            Prim::Frustum {
+                h, r_bot, r_top, ..
+            } => {
+                let r_max = r_top.max(r_bot) * 2.0;
+                let max_d = h.max(r_max);
+                let min_d = h.min(r_max);
+                min_d < clamped && max_d > 0.0 && min_d / max_d < ASPECT
+            }
+            // Spheres can't be degenerate (single radius).
+            Prim::Sphere { .. } => false,
+        }
+    }
+
     pub fn volume(&self) -> f32 {
         match *self {
             Prim::Obb { half_extents: h, .. } => 8.0 * h[0] * h[1] * h[2],

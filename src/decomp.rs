@@ -464,6 +464,7 @@ fn push_proximity_pairs(
     k: usize,
     max_angle_rad: f32,
     weighted_cost: bool,
+    reject_pancakes: bool,
 ) -> usize {
     let live = live_indices(prims);
     if live.len() < 2 {
@@ -505,11 +506,17 @@ fn push_proximity_pairs(
             let pb = &prims[b as usize];
             let (_q, prim_fit, vol, wvol, _vidx) =
                 merge_pair(pa, pb, mesh_verts, enabled);
-            let cost = if weighted_cost {
+            let mut cost = if weighted_cost {
                 wvol - (pa.weighted_volume + pb.weighted_volume)
             } else {
                 vol - (pa.volume + pb.volume)
             };
+            if reject_pancakes && prim_fit.is_pancake() {
+                // Push pancake-producing merges far down the PQ. Not infinite,
+                // so they can still be popped as a last resort if every
+                // candidate is degenerate.
+                cost = cost.abs() * 1000.0 + 1e6;
+            }
             if cost > volume_threshold {
                 return None;
             }
@@ -539,6 +546,7 @@ fn push_all_pairs(
     volume_threshold: f32,
     enabled: PrimMask,
     weighted_cost: bool,
+    reject_pancakes: bool,
 ) -> usize {
     let live = live_indices(prims);
     let mut pairs: Vec<(u32, u32)> = Vec::new();
@@ -558,11 +566,17 @@ fn push_all_pairs(
             let pa = &prims[a as usize];
             let pb = &prims[b as usize];
             let (_q, prim_fit, vol, wvol, _vidx) = merge_pair(pa, pb, mesh_verts, enabled);
-            let cost = if weighted_cost {
+            let mut cost = if weighted_cost {
                 wvol - (pa.weighted_volume + pb.weighted_volume)
             } else {
                 vol - (pa.volume + pb.volume)
             };
+            if reject_pancakes && prim_fit.is_pancake() {
+                // Push pancake-producing merges far down the PQ. Not infinite,
+                // so they can still be popped as a last resort if every
+                // candidate is degenerate.
+                cost = cost.abs() * 1000.0 + 1e6;
+            }
             if cost > volume_threshold {
                 return None;
             }
@@ -643,6 +657,16 @@ pub struct DecompOpts {
     /// the move that most reduces summed local Hausdorff. Keeps N
     /// constant. Targets greedy local minima at low N.
     pub rebalance: Option<usize>,
+    /// When true, merges that produce a "pancake-degenerate" primitive
+    /// (smallest half-extent at MIN_HALF_EXTENT clamp AND aspect ratio <
+    /// 0.001) get a 1000× cost multiplier in the priority queue, pushing
+    /// them to the bottom. Targets the failure mode where many disparate
+    /// near-coplanar faces from across the mesh merge into one giant
+    /// 1mm-thick slab whose surface drifts metres from the input. Fixes
+    /// big-architecture meshes (-13% to -37% Hausdorff on the test
+    /// building) but can regress vehicles whose long-narrow panels fall
+    /// on the same side of the threshold (blink: +75% Hausdorff).
+    pub reject_pancakes: bool,
 }
 
 /// Fraction of stratified-grid samples inside `prim` that are deeper than
@@ -814,11 +838,14 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
             let pb = &prims[n as usize];
             let (_q, prim_fit, vol, wvol, _vidx) =
                 merge_pair(pa, pb, &mesh.verts, opts.enabled);
-            let cost = if opts.weighted_cost {
+            let mut cost = if opts.weighted_cost {
                 wvol - (pa.weighted_volume + pb.weighted_volume)
             } else {
                 vol - (pa.volume + pb.volume)
             };
+            if opts.reject_pancakes && prim_fit.is_pancake() {
+                cost = cost.abs() * 1000.0 + 1e6;
+            }
             if cost > opts.volume_threshold {
                 return None;
             }
@@ -880,6 +907,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                         k,
                         angle_rad,
                         opts.weighted_cost,
+                        opts.reject_pancakes,
                     );
                     eprintln!(
                         "topology PQ drained at {} primitives; pushed {} proximity candidates (k={}, r={:.3}, angle<={:.0}°)",
@@ -902,6 +930,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
                         opts.volume_threshold,
                         opts.enabled,
                         opts.weighted_cost,
+                        opts.reject_pancakes,
                     );
                     eprintln!(
                         "topology PQ drained at {} primitives; pushed {} all-pairs candidates",
@@ -1144,11 +1173,14 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
             let pn = &prims[n as usize];
             let (_q, prim_fit, vol, wvol, _vidx) =
                 merge_pair(pa, pn, &mesh.verts, opts.enabled);
-            let cost = if opts.weighted_cost {
+            let mut cost = if opts.weighted_cost {
                 wvol - (pa.weighted_volume + pn.weighted_volume)
             } else {
                 vol - (pa.volume + pn.volume)
             };
+            if opts.reject_pancakes && prim_fit.is_pancake() {
+                cost = cost.abs() * 1000.0 + 1e6;
+            }
             if cost > opts.volume_threshold {
                 continue;
             }

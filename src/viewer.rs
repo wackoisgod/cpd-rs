@@ -221,13 +221,25 @@ const wire = new THREE.LineSegments(wireGeom, wireMat);
 wire.visible = false;
 inputGroup.add(wire);
 
-// frame the view
+// frame the view. URL param `?angle=iso|front|back|left|right|top|bottom`
+// lets headless screenshotters capture the model from different sides.
 inputGeom.computeBoundingBox();
 const bb = inputGeom.boundingBox;
 const center = bb.getCenter(new THREE.Vector3());
 const size = bb.getSize(new THREE.Vector3());
 const maxDim = Math.max(size.x, size.y, size.z);
-camera.position.copy(center).add(new THREE.Vector3(maxDim * 1.5, maxDim * 0.8, maxDim * 1.5));
+const angle = new URLSearchParams(window.location.search).get('angle') || 'iso';
+const angles = {
+  iso:    new THREE.Vector3(1.5, 0.8, 1.5),
+  front:  new THREE.Vector3(0.0, 0.2, 1.8),
+  back:   new THREE.Vector3(0.0, 0.2, -1.8),
+  right:  new THREE.Vector3(1.8, 0.2, 0.0),
+  left:   new THREE.Vector3(-1.8, 0.2, 0.0),
+  top:    new THREE.Vector3(0.001, 1.8, 0.001),
+  bottom: new THREE.Vector3(0.001, -1.8, 0.001),
+};
+const offset = (angles[angle] || angles.iso).clone().multiplyScalar(maxDim);
+camera.position.copy(center).add(offset);
 camera.lookAt(center);
 controls.target.copy(center);
 const homePos = camera.position.clone();

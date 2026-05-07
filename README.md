@@ -49,6 +49,7 @@ cpd <mesh.glb> <target_n> [out.obj]
     [--proximity]                  spatial-proximity replaces all-pairs fallback
     [--weighted-cost]              PQ ordering uses weighted volume (organic-friendly)
     [--rebalance]                  Lloyd-style face migration after greedy (experimental)
+    [--reject-pancakes]            penalise 1mm × N-metre slab merges (architecture)
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
         [--empty-space-distance <frac-of-diag>]   default 0.01
@@ -84,6 +85,10 @@ A fast iterate-and-validate loop:
 
 # 2. Headless screenshot of the viewer (uses macOS Chrome)
 ./scripts/screenshot.sh viewer.html out.png 1920 1080
+
+# Multi-angle (iso/front/back/left/right/top/bottom, montaged 4×2;
+# requires ImageMagick)
+./scripts/screenshot.sh viewer.html out.png 1280 720 --multi
 ```
 
 `metrics.json` carries per-run quantitative numbers (Hausdorff, Chamfer,
@@ -158,6 +163,31 @@ handles images (including agentic tooling).
   But on detail-heavy meshes the effect reverses (blink N=128: 5.04%
   → 6.72%; ram-visual N=256: 7.74% → 8.54%). Default off; turn on
   for organic / near-convex inputs (rocks, terrain, sculpted props).
+
+- **Pancake-merge penalty (`--reject-pancakes`).** Multiplies the merge
+  cost by 1000 when the resulting primitive's smallest half-extent has
+  clamped to `MIN_HALF_EXTENT` *and* its aspect ratio is < 0.001. This
+  pushes "1mm-thick × Nm-wide slab" merges to the bottom of the PQ —
+  any non-degenerate alternative is preferred. Targets the failure
+  mode where many disparate near-coplanar faces (rooftops across
+  buildings, walkways across an environment) all merge into one giant
+  flat primitive whose tessellated surface drifts metres past the
+  actual input geometry.
+
+  Measured on a fortified-building test mesh (architectural, large
+  flat horizontal surfaces):
+
+  | N    | default | --reject-pancakes |
+  | ---- | ------- | ----------------- |
+  | 64   | Haus 23.60% | **20.44%** (-13%), 55 prims |
+  | 128  | Haus 23.60% | **20.44%** (-13%), 113 prims |
+  | 256  | Haus 23.60% | **14.93%** (-37%), 217 prims |
+
+  Trade-off: primitive count drops (rejected merges starve the
+  algorithm), and detail-heavy meshes with long thin panels at the
+  same threshold can regress (blink: +75% Hausdorff). Default off; opt
+  in for buildings / architecture / environment art with prominent
+  flat collisions.
 
 - **Iterative face-rebalance (experimental, `--rebalance`).** After the
   greedy merge completes, run Lloyd-style face migration: for each

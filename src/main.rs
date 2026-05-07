@@ -28,6 +28,7 @@ struct CliArgs {
     proximity: Option<(f32, usize, f32)>, // (max_dist_frac, k, max_angle_rad)
     weighted_cost: bool,
     rebalance: Option<usize>,
+    reject_pancakes: bool,
     metrics: bool,
     metrics_json: Option<PathBuf>,
 }
@@ -46,6 +47,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut proximity: Option<(f32, usize, f32)> = None;
     let mut weighted_cost = false;
     let mut rebalance: Option<usize> = None;
+    let mut reject_pancakes = false;
     let mut metrics_flag = false;
     let mut metrics_json: Option<PathBuf> = None;
     let mut positional: Vec<String> = Vec::new();
@@ -93,6 +95,10 @@ fn parse_args() -> Result<CliArgs> {
             "--rebalance" => {
                 args.remove(0);
                 rebalance = Some(rebalance.unwrap_or(5));
+            }
+            "--reject-pancakes" => {
+                args.remove(0);
+                reject_pancakes = true;
             }
             "--rebalance-passes" => {
                 args.remove(0);
@@ -209,6 +215,7 @@ fn parse_args() -> Result<CliArgs> {
         proximity,
         weighted_cost,
         rebalance,
+        reject_pancakes,
         metrics: metrics_flag,
         metrics_json,
     })
@@ -238,6 +245,11 @@ fn print_usage() {
                             N constant; tries to escape greedy local
                             minima. Default 5 passes.
            [--rebalance-passes <N>]   override iteration count
+       [--reject-pancakes]  push merges that produce a 1mm-thick × Nm-wide
+                            slab to the bottom of the PQ. Targets
+                            architecture meshes with rooftops / wall
+                            collisions; can hurt vehicles with long thin
+                            panels at the same threshold.
        [--proximity]        spatial-proximity merges between disconnected
                             components. Adds candidate edges between nearby
                             components in the initial PQ, with cost ordering
@@ -339,6 +351,7 @@ fn main() -> Result<()> {
             proximity: args.proximity,
             weighted_cost: args.weighted_cost,
             rebalance: args.rebalance,
+            reject_pancakes: args.reject_pancakes,
         },
     );
     let merge_ms = t2.elapsed().as_secs_f64() * 1000.0;
