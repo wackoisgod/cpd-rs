@@ -35,6 +35,7 @@ struct CliArgs {
     cull_overlap: Option<f32>,
     axis_align: bool,
     world_axis_align: bool,
+    refine_search: Option<(f32, usize)>,
     tangent_eps: f32,
     metrics: bool,
     metrics_json: Option<PathBuf>,
@@ -61,6 +62,7 @@ fn parse_args() -> Result<CliArgs> {
     let mut cull_overlap: Option<f32> = None;
     let mut axis_align = false;
     let mut world_axis_align = false;
+    let mut refine_search: Option<(f32, usize)> = None;
     let mut tangent_eps: f32 = 0.01; // paper §3.4 default
     let mut metrics_flag = false;
     let mut metrics_json: Option<PathBuf> = None;
@@ -177,6 +179,28 @@ fn parse_args() -> Result<CliArgs> {
             "--world-axis" => {
                 args.remove(0);
                 world_axis_align = true;
+            }
+            "--refine-search" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--refine-search needs a threshold-frac-of-diag value")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                let prev = refine_search.map(|(_, m)| m).unwrap_or(20);
+                refine_search = Some((f, prev));
+            }
+            "--refine-search-iters" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--refine-search-iters needs an integer")?;
+                args.remove(0);
+                let m: usize = v.parse().context("not an integer")?;
+                let prev = refine_search.map(|(f, _)| f).unwrap_or(0.05);
+                refine_search = Some((prev, m));
             }
             "--no-tangent-eps" => {
                 args.remove(0);
@@ -310,6 +334,7 @@ fn parse_args() -> Result<CliArgs> {
         cull_overlap,
         axis_align,
         world_axis_align,
+        refine_search,
         tangent_eps,
         metrics: metrics_flag,
         metrics_json,
@@ -485,6 +510,7 @@ fn main() -> Result<()> {
             cull_overlap: args.cull_overlap,
             axis_align: args.axis_align,
             world_axis_align: args.world_axis_align,
+            refine_search: args.refine_search,
             tangent_eps: args.tangent_eps,
         },
     );

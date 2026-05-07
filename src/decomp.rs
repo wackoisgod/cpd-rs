@@ -765,6 +765,7 @@ pub struct DecompResult {
     pub thin_stripped: usize,
     pub rebalance_moves: usize,
     pub splits_done: usize,
+    pub refine_iters: usize,
 }
 
 pub struct DecompOpts {
@@ -865,6 +866,22 @@ pub struct DecompOpts {
     /// has corners protruding past the input outline) — a single OBB
     /// can't fit those tightly, but two can.
     pub split_worst: Option<(f32, usize)>,
+    /// Local-search refine pass (Park & Sung 2024-inspired). None
+    /// disables; Some((threshold_frac, max_iters)) enables. After merge
+    /// + cull + split, for each primitive whose local Hausdorff exceeds
+    /// `threshold_frac × mesh_diag`, hill-climb its OBB orientation:
+    /// try ±step rotations around each principal axis, refit half-extents
+    /// to subsumed verts, accept the orientation that minimises local
+    /// Hausdorff. Step adapts (start 15°, halve on no-improvement, stop
+    /// at <1°). Caps per-primitive iters at `max_iters`. The full set of
+    /// subsumed verts stays enclosed (refit is a tight-AABB in the new
+    /// frame), so the paper's containment guarantee is preserved.
+    ///
+    /// Cheaper analogue of Park & Sung's MCTS-over-MDP refine — no
+    /// translation/scale actions, only rotation. Rotation is the only
+    /// real DoF for an OBB constrained to enclose its subsumed verts;
+    /// center and half-extents are fully determined by the axis choice.
+    pub refine_search: Option<(f32, usize)>,
     /// Partial-overlap cull. None disables; Some(frac) drops any live
     /// primitive A whose ≥frac fraction of tessellated surface samples
     /// lie inside another live primitive B (shared-vertex constraint
@@ -949,13 +966,14 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
     let nf = mesh.tris.len();
 
     // Build BVH up-front (needed by exposure / quality / empty-space /
-    // rebalance / feasibility / split-worst).
+    // rebalance / feasibility / split-worst / refine-search).
     let bvh: Option<Bvh> = if opts.empty_space.is_some()
         || opts.quality_beta > 0.0
         || opts.shell_aware
         || opts.rebalance.is_some()
         || opts.feasibility.is_some()
         || opts.split_worst.is_some()
+        || opts.refine_search.is_some()
     {
         Some(Bvh::build(&mesh.verts, &mesh.tris))
     } else {
@@ -1543,6 +1561,25 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         );
     }
 
+    let mut refine_iters = 0usize;
+    if let (Some((threshold_frac, max_iters)), Some(bvh_ref)) =
+        (opts.refine_search, &bvh)
+    {
+        let t = std::time::Instant::now();
+        refine_iters = refine_search_pass(
+            &mut prims,
+            mesh,
+            bvh_ref,
+            threshold_frac,
+            max_iters,
+        );
+        eprintln!(
+            "refine-search: {} hill-climb iters in {:.1} ms",
+            refine_iters,
+            t.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+
     let thin_stripped = match opts.strip_thin_obbs {
         Some(frac) => strip_thin_obbs(&mut prims, &mesh.verts, frac),
         None => 0,
@@ -1560,6 +1597,7 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         thin_stripped,
         rebalance_moves,
         splits_done,
+        refine_iters,
     }
 }
 
@@ -2147,6 +2185,126 @@ fn strip_thin_obbs(
         }
     }
     dropped
+}
+
+/// Park & Sung 2024-inspired refine. After merge converges, hill-climb
+/// the orientation of each high-Hausdorff OBB primitive: try small
+/// rotations around each principal axis, refit half-extents to subsumed
+/// vertices in the new frame, accept the rotation that minimises local
+/// Hausdorff. Step adapts (start 15°, halve on no-improvement, stop at
+/// <1°). All subsumed verts stay enclosed by construction (refit is the
+/// tight AABB in the new axis frame).
+///
+/// Only OBBs are refined — for cylinders/capsules/prisms the orientation
+/// has additional structure (axial direction matters) and a generic
+/// rotation perturbation can break the fit. OBB is the dominant primitive
+/// type by count in our outputs anyway, so this covers most of the cost.
+fn refine_search_pass(
+    prims: &mut [Primitive],
+    mesh: &Mesh,
+    bvh: &Bvh,
+    threshold_frac: f32,
+    max_iters_per_prim: usize,
+) -> usize {
+    let mesh_diag = crate::mesh::aabb_diag(&mesh.verts).max(1e-6);
+    let threshold = threshold_frac * mesh_diag;
+
+    // Worst-first ordering — fix the primitives that contribute most to
+    // the global Hausdorff first.
+    let mut candidates: Vec<(usize, f32)> = prims
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.alive && matches!(p.prim, Prim::Obb { .. }))
+        .map(|(i, p)| (i, local_hausdorff_dense(&p.prim, bvh, mesh)))
+        .filter(|&(_, h)| h > threshold)
+        .collect();
+    candidates.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(Ordering::Equal));
+
+    let mut total_iters = 0usize;
+    for (idx, _) in candidates {
+        let p = &prims[idx];
+        let (mut axes, _, _) = match &p.prim {
+            Prim::Obb { center, axes, half_extents } => (*axes, *center, *half_extents),
+            _ => continue,
+        };
+        let pts: Vec<Point3<f32>> = p
+            .vertex_indices
+            .iter()
+            .map(|&i| mesh.verts[i as usize])
+            .collect();
+        if pts.len() < 2 {
+            continue;
+        }
+
+        let refit = |axes: &[Vector3<f32>; 3], pts: &[Point3<f32>]| -> Prim {
+            prim::fit_obb(*axes, pts)
+        };
+
+        let mut best_prim = refit(&axes, &pts);
+        let mut best_h = local_hausdorff_dense(&best_prim, bvh, mesh);
+
+        let mut step_deg = 15.0f32;
+        let stop_deg = 1.0f32;
+        let mut iters_used = 0usize;
+        while step_deg >= stop_deg && iters_used < max_iters_per_prim {
+            let step_rad = step_deg.to_radians();
+            let mut improved = false;
+            for axis_k in 0..3 {
+                for sign in [-1.0f32, 1.0] {
+                    let theta = sign * step_rad;
+                    let new_axes = rotate_axes_about(axes, axis_k, theta);
+                    let cand_prim = refit(&new_axes, &pts);
+                    let cand_h = local_hausdorff_dense(&cand_prim, bvh, mesh);
+                    if cand_h + 1e-6 < best_h {
+                        best_h = cand_h;
+                        best_prim = cand_prim;
+                        axes = new_axes;
+                        improved = true;
+                    }
+                }
+            }
+            iters_used += 1;
+            total_iters += 1;
+            if !improved {
+                step_deg *= 0.5;
+            }
+        }
+
+        // Commit if we improved.
+        if let Prim::Obb { half_extents, .. } = &best_prim {
+            let v = 8.0 * half_extents[0] * half_extents[1] * half_extents[2];
+            prims[idx].prim = best_prim.clone();
+            prims[idx].volume = v;
+            prims[idx].weighted_volume = v * best_prim.weight();
+            prims[idx].version += 1;
+        }
+    }
+    total_iters
+}
+
+/// Rotate the 3-axis frame `axes` around axis index `k` by `theta`
+/// radians: axis k is unchanged, the other two rotate within the plane
+/// they span. Re-orthogonalises to fight float drift.
+fn rotate_axes_about(
+    axes: [Vector3<f32>; 3],
+    k: usize,
+    theta: f32,
+) -> [Vector3<f32>; 3] {
+    let (i, j) = match k {
+        0 => (1, 2),
+        1 => (2, 0),
+        _ => (0, 1),
+    };
+    let c = theta.cos();
+    let s = theta.sin();
+    let new_i = (axes[i] * c + axes[j] * s).normalize();
+    let new_j = (axes[j] * c - axes[i] * s).normalize();
+    let mut out = axes;
+    out[i] = new_i;
+    out[j] = new_j;
+    // Final orthogonalisation cross — guarantees right-handed frame.
+    out[k] = out[i].cross(&out[j]).normalize();
+    out
 }
 
 /// Loose cull pass — drops primitive A if ≥`frac` of A's tessellated

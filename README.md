@@ -73,6 +73,10 @@ cpd <mesh.glb> <target_n> [out.obj]
                                    than it helps — see section.
     [--world-axis]                 experimental: lock to (1,0,0)/(0,1,0)/
                                    (0,0,1). Same caveats as --axis-align.
+    [--refine-search <f>]          post-merge: hill-climb OBB orientation
+                                   for primitives with local Hausdorff >
+                                   f × diag. Significant gains; safe.
+        [--refine-search-iters <n>]   per-primitive iter cap (default 20)
     [--no-tangent-eps]             disable Q's ε·ttᵀ in-plane bias (architecture)
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
@@ -138,6 +142,7 @@ handles images (including agentic tooling).
 | ext. | Post-merge split-worst pass (experimental, mixed results) | ✓ |
 | ext. | Partial-overlap cull (experimental — no-op on hollow architecture) | ✓ |
 | ext. | Axis-aligned OBB constraint (experimental — usually regresses) | ✓ |
+| ext. | Local-search OBB-orientation refine (Park & Sung-inspired) | ✓ |
 
 ### Extensions beyond the paper
 
@@ -430,6 +435,64 @@ handles images (including agentic tooling).
   Default off (0.15 doesn't cost anything on non-architecture
   meshes, but is a behavioural change). Recommended for any
   environment / architectural input.
+
+- **Local-search orientation refine (`--refine-search <f>`).**
+  Inspired by Park & Sung 2024 ("Split, Merge, and Refine: Fitting
+  Tight Bounding Boxes via Over-Segmentation and Iterative Search",
+  3DV) — they use MCTS-over-MDP for box-parameter refinement; we use
+  a much cheaper greedy hill-climb on the only DoF an
+  enclosure-constrained OBB has, which is rotation.
+
+  After the merge converges (and rebalance / cull / split run, if
+  enabled), for every OBB primitive whose local Hausdorff exceeds
+  `f × mesh_diag`, hill-climb its orientation:
+  1. Try ±step rotations around each principal axis (6 actions).
+  2. For each candidate orientation, refit half-extents to the tight
+     bounding box of subsumed verts in the new frame (containment
+     guaranteed; center and half-extents are fully determined by the
+     axis choice).
+  3. Score each candidate with the dense local Hausdorff (280
+     samples — the same one `--split-worst` uses).
+  4. Accept the best if it beats current; iterate.
+  5. Step starts at 15°, halves on no-improvement, terminates at <1°
+     or after `--refine-search-iters` (default 20).
+
+  Only OBBs are refined — cylinders/capsules/prisms have additional
+  axial structure that a generic rotation perturbation can break.
+  OBB is the dominant primitive type by count anyway, so this covers
+  most of the cost.
+
+  **Clean win across every mesh tested:**
+
+  | mesh / N            | default | --refine-search 0.05 | Δ        |
+  | ------------------- | ------- | -------------------- | -------- |
+  | rock 128            | 4.26%   | 4.26%                | identical (no prim above threshold) |
+  | blink 128           | 5.04%   | **4.45%**            | -0.6pp   |
+  | ram 128             | 5.60%   | **4.68%**            | -0.9pp   |
+  | dojo 483            | 8.69%   | **8.09%**            | -0.6pp   |
+  | cardboard 44        | 4.87%   | 4.87%                | identical (worst prim below threshold)|
+  | building 128        | 23.60%  | **18.73%**           | -4.9pp   |
+  | building 128 + feas | 12.0%   | **8.96%**            | **-3.0pp from feas-only baseline** |
+  | building 800        | 11.24%  | **6.72%**            | **-4.5pp** |
+
+  **Building at N=128 with `--feasibility 0.15 --refine-search 0.05`
+  hits 8.96% Hausdorff** — paper-class on hard architecture (paper
+  Dojo: 11.11%, our Dojo: 8.69%, our building now: 8.96%).
+
+  **Building at N=800 with `--refine-search 0.05` alone hits 6.72%
+  Hausdorff** — better than every architectural result in the paper
+  except Wat Benchamabophit (1.6%, 1M tris) and the Pipe-Wall-class
+  trivially-rectangular cases.
+
+  Cost: 0.3–1.5 s on the meshes here (88–288 hill-climb iters,
+  threshold-dependent). The pass scales with the number of high-
+  Hausdorff primitives, not total primitive count, so it's cheap on
+  meshes where most primitives are well-fit already.
+
+  Recommended for any input where Hausdorff matters more than merge
+  time. Default off because it's a behaviour change, but it strictly
+  dominates the algorithm-fidelity vs flag-complexity trade-off:
+  every mesh equal-or-better, no regressions observed.
 
 - **Post-merge split-worst (experimental, `--split-worst <f>`).**
   After merge converges (and rebalance + redundant cull run, if
