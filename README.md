@@ -63,6 +63,11 @@ cpd <mesh.glb> <target_n> [out.obj]
                                    their longest PCA / world axis (median
                                    split). Mixed results — see section.
         [--split-worst-max <int>]  cap on splits (default 32)
+    [--cull-overlap <f>]           experimental: drop any primitive A whose
+                                   ≥f fraction of surface samples lie inside
+                                   another primitive B (with A.vol ≤ B.vol).
+                                   Largely a no-op on hollow architecture
+                                   (true overlap is rare) — see section.
     [--no-tangent-eps]             disable Q's ε·ttᵀ in-plane bias (architecture)
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
@@ -126,6 +131,7 @@ handles images (including agentic tooling).
 | ext. | Reverse Hausdorff (input → primitive surface) + coverage fraction | ✓ |
 | ext. | Merge-time feasibility check (rejects slab merges, paper §3.3 unsolved) | ✓ |
 | ext. | Post-merge split-worst pass (experimental, mixed results) | ✓ |
+| ext. | Partial-overlap cull (experimental — no-op on hollow architecture) | ✓ |
 
 ### Extensions beyond the paper
 
@@ -148,6 +154,38 @@ handles images (including agentic tooling).
   unrelated components together. We additionally require A and B to share
   at least one mesh vertex — i.e., they were topologically related at some
   point during the merge — which preserves tight per-component fits.
+
+- **Partial-overlap cull (experimental, `--cull-overlap <frac>`).**
+  Loose-cull pass: drops primitive A if ≥`frac` of A's tessellated
+  surface samples lie inside some other primitive B (with A.volume ≤
+  B.volume). Catches the visible-stacking issue where strict
+  `cull_redundant` (full vertex containment) misses partial overlap.
+
+  **Largely a no-op on hollow architecture.** Tested on the building at
+  N=800 across thresholds:
+
+  | threshold | culled | coverage | observation |
+  | --------- | ------ | -------- | ----------- |
+  | 0.95      | 0      | 99.92%   | nothing 95%-inside-another |
+  | 0.85      | 0      | 99.92%   | nothing 85%-inside-another |
+  | 0.75      | 1      | 99.92%   | one stragger |
+  | 0.50      | 4      | 99.89%   | minor cleanup |
+  | 0.30      | 13     | 98.4%    | starts eating real coverage |
+  | 0.20      | 336    | 84.2%    | catastrophic |
+  | 0.10      | 577    | 52.3%    | broken |
+
+  At sane thresholds (≥0.85), the cull finds essentially no overlap.
+  Direct math confirms: the building's 799 primitives sum to 62.5 m³
+  total volume in a 54,647 m³ AABB (0.11% volume ratio — building is
+  hollow). If primitives heavily overlapped each other, the volume sum
+  would be much larger than the actual hollow-shell volume. It isn't.
+  The visible "vertical stripes" of OBB wireframes in viewer
+  screenshots are adjacent thin-wall OBBs packed along walls, not
+  overlapping ones.
+
+  Kept as an option for the rare case where it might help (highly
+  redundant initial decompositions, post-rebalance state). Default off.
+  Don't expect Hausdorff or coverage gains on hollow architecture.
 
 - **Hausdorff-aware refit (experimental, `--quality <beta>`).** When `beta
   > 0` the post-merge refit ranks candidates by
@@ -532,6 +570,36 @@ handles images (including agentic tooling).
   radius. The volume formula gives a misleadingly small number, so the
   disk wins selection despite extending far beyond the cloud. We skip
   axes whose axial extent is < 5% of the largest axial extent.
+
+- **Validated against paper meshes.** Downloaded the same Cardboard
+  Boxes (jellystuff) and Modern Karate Dojo (Mikail Karaca / Xavaltir)
+  meshes the paper benchmarks. At paper's N:
+
+  | mesh | tris | N | paper Haus | ours Haus | verdict |
+  | ---- | ---- | -- | ---------- | --------- | ------- |
+  | Cardboard Boxes | 119 | 44 | 1.53% | 4.87% | 3× off |
+  | **Dojo** | 4,569 | 483 | **11.11%** | **8.69%** | **22% better than paper** |
+
+  We **beat the paper on Dojo** — same mesh (4569 vs our 4558 tris,
+  difference is degenerate-face filtering), same target primitive
+  count, lower Hausdorff. Our building's ~12% (or 11.2% at N=800,
+  paper-equivalent density) is in the same bucket as paper's hard
+  architecture (Chuo House 10.2%, Lantern 11.2%, Dojo 11.1%). We're
+  not missing anything fundamental in the algorithm.
+
+  Cardboard Boxes is the one outlier where we trail paper. Tried
+  varying primitive-fit gates, weld eps, volume threshold, weighted
+  cost, feasibility — none changes the metric materially. The mesh
+  has 13 separate components, and something about the multi-component
+  fitting is leaving 3% extra drift. Open follow-up.
+
+  Validation also surfaced a **real metrics bug**: NaN in primitive
+  tessellation propagated through the area sum, made `global_total =
+  NaN`, the `<= 0.0` check is false for NaN so we didn't early-return,
+  but the binary-search-by-NaN-r returned out-of-range every iteration,
+  skipping all 10000 samples and silently reporting `samples used: 0
+  / hausdorff fwd: 0.00%`. Was masking the Dojo result entirely until
+  fixed (sanitize NaN tessellations, zero out areas).
 
 - **Self-evaluation loop.** `--metrics` computes:
   - **Forward Hausdorff/Chamfer** (paper §4.4): primitive surface →

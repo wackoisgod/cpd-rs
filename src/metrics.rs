@@ -165,13 +165,29 @@ pub fn compute(prims: &[Primitive], mesh: &Mesh, n_samples: u32) -> Metrics {
         }] += 1;
 
         let (verts, tris) = prim::tessellate(&p.prim);
+        // Defend against NaN in tessellation: a single non-finite vertex
+        // turns its triangle's area into NaN, NaN propagates into cum,
+        // global_total becomes NaN, every binary-search probe returns
+        // out-of-range, and the entire forward sample loop produces 0
+        // hits. Sanitize per-tri area to 0 if non-finite — primitives
+        // with broken tessellations contribute nothing rather than
+        // poisoning the metric.
+        let any_nan_vert = verts.iter().any(|v| !v[0].is_finite() || !v[1].is_finite() || !v[2].is_finite());
+        let (verts, tris) = if any_nan_vert {
+            (Vec::new(), Vec::new())
+        } else {
+            (verts, tris)
+        };
         let mut cum = Vec::with_capacity(tris.len());
         let mut acc = 0.0f32;
         for t in &tris {
             let a = Vector3::new(verts[t[0] as usize][0], verts[t[0] as usize][1], verts[t[0] as usize][2]);
             let b = Vector3::new(verts[t[1] as usize][0], verts[t[1] as usize][1], verts[t[1] as usize][2]);
             let c = Vector3::new(verts[t[2] as usize][0], verts[t[2] as usize][1], verts[t[2] as usize][2]);
-            let area = 0.5 * (b - a).cross(&(c - a)).norm();
+            let mut area = 0.5 * (b - a).cross(&(c - a)).norm();
+            if !area.is_finite() {
+                area = 0.0;
+            }
             acc += area;
             cum.push(acc);
         }
