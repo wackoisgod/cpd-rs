@@ -48,6 +48,7 @@ cpd <mesh.glb> <target_n> [out.obj]
     [--shell]                      experimental shell-aware orientation
     [--proximity]                  spatial-proximity replaces all-pairs fallback
     [--weighted-cost]              PQ ordering uses weighted volume (organic-friendly)
+    [--rebalance]                  Lloyd-style face migration after greedy (experimental)
     [--empty-space]                hard-reject merges bridging open space
         [--empty-space-fraction <0..1>]   default 0.25
         [--empty-space-distance <frac-of-diag>]   default 0.01
@@ -157,6 +158,35 @@ handles images (including agentic tooling).
   But on detail-heavy meshes the effect reverses (blink N=128: 5.04%
   → 6.72%; ram-visual N=256: 7.74% → 8.54%). Default off; turn on
   for organic / near-convex inputs (rocks, terrain, sculpted props).
+
+- **Iterative face-rebalance (experimental, `--rebalance`).** After the
+  greedy merge completes, run Lloyd-style face migration: for each
+  boundary face, try moving it to each adjacent primitive; accept the
+  move that most reduces a combined `weighted_volume × (1 + 5·h/diag)`
+  cost. Keeps `N` constant (a primitive's last face can't migrate
+  away). Iterates until no moves are accepted, capped at
+  `--rebalance-passes` (default 5).
+
+  **Marginal and inconsistent in practice.** Counts and volumes are
+  preserved, but the metric improvements are small at low N and
+  *regress* at higher N:
+
+  | mesh | N | Hausdorff (off → on) |
+  | ---- | -- | ------------------- |
+  | rock | 64 | 6.39% → 6.29% (-1.6%) |
+  | rock | 128 | 4.26% → 5.18% (worse) |
+  | rock | 256 | 2.56% → 3.59% (worse) |
+  | blink | 128 | 5.04% → 4.73% (-6%) |
+  | ram-s | 128 | 5.60% → 8.32% (worse) |
+
+  Why it underperforms: **Lloyd minimises the *sum* of per-primitive
+  scores; Hausdorff is a *max* metric.** Local moves can improve a
+  pair's combined score while making the global worst-case worse. To
+  actually reduce Hausdorff you'd need to specifically target the
+  worst-fit primitive each iteration (split-and-redistribute), which
+  is a different algorithm. The current implementation is kept as an
+  experimental option and as scaffolding (DSU + linked-list rebuild)
+  for that future direction. Default off.
 
 - **Adaptive sharp-edge threshold.** Replaces the fixed 30° dihedral
   threshold for sharp-edge feature detection with a per-mesh value:

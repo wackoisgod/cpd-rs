@@ -5,7 +5,7 @@ use crate::prim::{self, Prim, PrimMask};
 use nalgebra::{Matrix3, Point3, SymmetricEigen, Vector3};
 use rayon::prelude::*;
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::{BinaryHeap, HashMap, HashSet};
 
 const TANGENT_EPS: f32 = 0.01;
 
@@ -592,6 +592,7 @@ pub struct DecompResult {
     pub merges_rejected_empty: usize,
     pub all_pairs_used: bool,
     pub redundant_culled: usize,
+    pub rebalance_moves: usize,
 }
 
 pub struct DecompOpts {
@@ -635,6 +636,13 @@ pub struct DecompOpts {
     /// the cost of detail-heavy meshes (vehicles: 10-37% Hausdorff
     /// regression).
     pub weighted_cost: bool,
+    /// Lloyd-style face-migration rebalance after the greedy merge
+    /// completes. None disables; Some(max_passes) iterates that many
+    /// passes (early-exits when no moves happen). Each pass: for every
+    /// boundary face, try moving it to each adjacent primitive, accept
+    /// the move that most reduces summed local Hausdorff. Keeps N
+    /// constant. Targets greedy local minima at low N.
+    pub rebalance: Option<usize>,
 }
 
 /// Fraction of stratified-grid samples inside `prim` that are deeper than
@@ -686,10 +694,12 @@ fn empty_space_fraction(
 pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
     let nf = mesh.tris.len();
 
-    // Build BVH up-front (needed by exposure / quality / empty-space).
+    // Build BVH up-front (needed by exposure / quality / empty-space /
+    // rebalance).
     let bvh: Option<Bvh> = if opts.empty_space.is_some()
         || opts.quality_beta > 0.0
         || opts.shell_aware
+        || opts.rebalance.is_some()
     {
         Some(Bvh::build(&mesh.verts, &mesh.tris))
     } else {
@@ -1155,6 +1165,31 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         }
     }
 
+    // Lloyd-style face rebalance: try moving boundary faces between
+    // primitives to escape the greedy local minimum. Run BEFORE the
+    // redundant-cull pass so the cull operates on the rebalanced state.
+    let mut rebalance_moves = 0usize;
+    if let Some(max_passes) = opts.rebalance {
+        if let Some(bvh_ref) = &bvh {
+            let t = std::time::Instant::now();
+            rebalance_moves = rebalance_faces(
+                &mut prims,
+                mesh,
+                adj,
+                &mut dsu,
+                &mut face_next,
+                bvh_ref,
+                opts.enabled,
+                max_passes,
+            );
+            eprintln!(
+                "rebalance: {} total face moves in {:.1} ms",
+                rebalance_moves,
+                t.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+    }
+
     let mut redundant_culled = 0usize;
     if opts.cull_redundant {
         redundant_culled = cull_redundant(&mut prims, &mesh.verts);
@@ -1167,7 +1202,250 @@ pub fn run(mesh: &Mesh, adj: &Adjacency, opts: DecompOpts) -> DecompResult {
         merges_rejected_empty,
         all_pairs_used,
         redundant_culled,
+        rebalance_moves,
     }
+}
+
+/// Compact per-primitive cache used by the Lloyd rebalance pass. Storing
+/// the fitted primitive + Hausdorff score avoids re-running fit_best on
+/// the same group when only its score is needed.
+struct RebalanceState {
+    prim: Prim,
+    q: Matrix3<f32>,
+    volume: f32,
+    weighted_volume: f32,
+    /// Sampled local Hausdorff to the input mesh (cheap proxy for fit
+    /// quality, same metric the cull and refit-quality paths use).
+    hausdorff: f32,
+    /// Sorted-unique vertex indices subsumed by the primitive's faces.
+    vertex_indices: Vec<u32>,
+}
+
+fn refit_from_faces(
+    faces: &[u32],
+    mesh: &Mesh,
+    enabled: PrimMask,
+    bvh: &Bvh,
+) -> RebalanceState {
+    // Sum per-face quadrics, gather subsumed vertices.
+    let mut q = Matrix3::zeros();
+    let mut vidx_set: HashSet<u32> = HashSet::new();
+    for &fi in faces {
+        let t = mesh.tris[fi as usize];
+        let p0 = mesh.verts[t[0] as usize];
+        let p1 = mesh.verts[t[1] as usize];
+        let p2 = mesh.verts[t[2] as usize];
+        q += face_quadric(p0, p1, p2);
+        vidx_set.insert(t[0]);
+        vidx_set.insert(t[1]);
+        vidx_set.insert(t[2]);
+    }
+    let mut vidx: Vec<u32> = vidx_set.into_iter().collect();
+    vidx.sort();
+    let pts: Vec<Point3<f32>> = vidx.iter().map(|&i| mesh.verts[i as usize]).collect();
+    let axes = axes_from_q(q);
+    let prim_fit = prim::fit_best(axes, &pts, enabled);
+    let h = local_hausdorff(&prim_fit, bvh, mesh);
+    RebalanceState {
+        volume: prim_fit.volume(),
+        weighted_volume: prim_fit.weighted_volume(),
+        prim: prim_fit,
+        q,
+        hausdorff: h,
+        vertex_indices: vidx,
+    }
+}
+
+/// Lloyd-style face migration. Starts from the greedy merge result and
+/// iteratively moves boundary faces between adjacent primitives; accepts
+/// any move that reduces the summed local Hausdorff of the two primitives
+/// it touches. Keeps the primitive count fixed (a face can only move if
+/// its source primitive has more than one face). Pure local rebalancing —
+/// breaks greedy local minima without changing N.
+fn rebalance_faces(
+    prims: &mut Vec<Primitive>,
+    mesh: &Mesh,
+    adj: &Adjacency,
+    dsu: &mut Dsu,
+    face_next: &mut Vec<u32>,
+    bvh: &Bvh,
+    enabled: PrimMask,
+    max_passes: usize,
+) -> usize {
+    // Combined cost so we don't accept moves that improve Hausdorff at
+    // catastrophic volume cost. Same shape as --quality.
+    let mesh_diag = crate::mesh::aabb_diag(&mesh.verts).max(1e-6);
+    let beta = 5.0f32;
+    let score_state = |s: &RebalanceState| -> f32 {
+        s.weighted_volume * (1.0 + beta * s.hausdorff / mesh_diag)
+    };
+    let nf = mesh.tris.len();
+
+    // Compact existing primitives to 0..N. dsu.find(face_idx) gives the
+    // primitive's representative root face_idx; map those to dense ids.
+    let mut root_to_id: HashMap<u32, u32> = HashMap::new();
+    let mut face_assignment: Vec<u32> = Vec::with_capacity(nf);
+    for f in 0..nf {
+        let root = dsu.find(f as u32);
+        let id = match root_to_id.get(&root) {
+            Some(&id) => id,
+            None => {
+                let id = root_to_id.len() as u32;
+                root_to_id.insert(root, id);
+                id
+            }
+        };
+        face_assignment.push(id);
+    }
+    let n_prims = root_to_id.len();
+    if n_prims < 2 {
+        return 0;
+    }
+    let mut prim_faces: Vec<Vec<u32>> = vec![Vec::new(); n_prims];
+    for (fi, &pid) in face_assignment.iter().enumerate() {
+        prim_faces[pid as usize].push(fi as u32);
+    }
+
+    // Refit from face groups so the rebalance state matches what's about
+    // to be tracked (the greedy pass had its own per-primitive state, but
+    // for migration we want a single source of truth).
+    let mut state: Vec<RebalanceState> = (0..n_prims)
+        .map(|pid| refit_from_faces(&prim_faces[pid], mesh, enabled, bvh))
+        .collect();
+
+    let mut total_moves = 0usize;
+    for pass in 0..max_passes {
+        let mut moves = 0usize;
+        for f in 0..nf {
+            let current_p = face_assignment[f] as usize;
+            // Don't empty a primitive — that would drop the count.
+            if prim_faces[current_p].len() <= 1 {
+                continue;
+            }
+            // Candidate primitives: those held by topologically-adjacent
+            // faces, minus our current primitive.
+            let mut candidates: Vec<u32> = adj.neighbors[f]
+                .iter()
+                .map(|&nf_idx| face_assignment[nf_idx as usize])
+                .filter(|&p| p as usize != current_p)
+                .collect();
+            candidates.sort_unstable();
+            candidates.dedup();
+            if candidates.is_empty() {
+                continue;
+            }
+
+            let old_score = score_state(&state[current_p]);
+            let mut best_pid: Option<u32> = None;
+            let mut best_new_a: Option<RebalanceState> = None;
+            let mut best_new_b: Option<RebalanceState> = None;
+            let mut best_delta = 0.0f32;
+
+            for cand in candidates {
+                let cand_p = cand as usize;
+                let cand_score = score_state(&state[cand_p]);
+                let old_combined = old_score + cand_score;
+
+                let new_a_faces: Vec<u32> = prim_faces[current_p]
+                    .iter()
+                    .filter(|&&x| x != f as u32)
+                    .copied()
+                    .collect();
+                let mut new_b_faces = prim_faces[cand_p].clone();
+                new_b_faces.push(f as u32);
+
+                let new_a = refit_from_faces(&new_a_faces, mesh, enabled, bvh);
+                let new_b = refit_from_faces(&new_b_faces, mesh, enabled, bvh);
+                let new_combined = score_state(&new_a) + score_state(&new_b);
+                let delta = new_combined - old_combined;
+                if delta < best_delta {
+                    best_delta = delta;
+                    best_pid = Some(cand);
+                    best_new_a = Some(new_a);
+                    best_new_b = Some(new_b);
+                }
+            }
+
+            if let Some(target) = best_pid {
+                let target_p = target as usize;
+                face_assignment[f] = target;
+                prim_faces[current_p].retain(|&x| x != f as u32);
+                prim_faces[target_p].push(f as u32);
+                state[current_p] = best_new_a.unwrap();
+                state[target_p] = best_new_b.unwrap();
+                moves += 1;
+            }
+        }
+        eprintln!(
+            "rebalance pass {}: {} face moves",
+            pass + 1,
+            moves
+        );
+        total_moves += moves;
+        if moves == 0 {
+            break;
+        }
+    }
+
+    // Rebuild dsu + face_next + prims from the final face assignment.
+    *dsu = Dsu::new(nf);
+    for pid in 0..n_prims {
+        let faces = &prim_faces[pid];
+        if faces.is_empty() {
+            continue;
+        }
+        // Splice all faces in this primitive into one cyclic linked list,
+        // and union them in the DSU under the first face as the root.
+        let root = faces[0];
+        for &f in &faces[1..] {
+            dsu.link(root, f);
+        }
+        // Build the cyclic list: face_next[f_i] = f_{i+1}, last → root
+        for i in 0..faces.len() {
+            let next = if i + 1 < faces.len() {
+                faces[i + 1]
+            } else {
+                faces[0]
+            };
+            face_next[faces[i] as usize] = next;
+        }
+        // Mark the data slot at `root` as the live primitive.
+        let s = &state[pid];
+        prims[root as usize] = Primitive {
+            alive: true,
+            version: prims[root as usize].version + 1,
+            q: s.q,
+            prim: s.prim.clone(),
+            volume: s.volume,
+            weighted_volume: s.weighted_volume,
+            face_count: faces.len() as u32,
+            vertex_indices: s.vertex_indices.clone(),
+            // Neighbors will be re-derived: find unique adjacent primitive
+            // roots from face adjacency.
+            neighbors: HashSet::new(),
+        };
+    }
+    // Mark everything else dead.
+    for fi in 0..nf {
+        if dsu.find(fi as u32) != fi as u32 {
+            prims[fi].alive = false;
+            prims[fi].vertex_indices = Vec::new();
+            prims[fi].face_count = 0;
+            prims[fi].neighbors.clear();
+        }
+    }
+    // Rebuild neighbour sets at primitive roots.
+    for f in 0..nf {
+        let p = dsu.find(f as u32);
+        for &nf_idx in &adj.neighbors[f] {
+            let q = dsu.find(nf_idx);
+            if p != q {
+                prims[p as usize].neighbors.insert(q);
+            }
+        }
+    }
+
+    total_moves
 }
 
 /// Drop primitive A if every vertex it subsumes is also enclosed by some
