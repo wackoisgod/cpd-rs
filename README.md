@@ -58,16 +58,58 @@ cpd <mesh.glb> <target_n> [out.obj]
                                    local Hausdorff > f × diag. Try 0.15 for
                                    architecture meshes; no-op on meshes
                                    without slab pathology.
+    [--subdivide-bad-faces <f>]    experimental prepass: split oversized
+                                   input triangles whose one-face primitive
+                                   has local Hausdorff > f × diag.
+        [--subdivide-bad-faces-max-depth <int>]  cap depth (default 1)
     [--split-worst <f>]            experimental post-merge: split primitives
                                    with local Hausdorff > f × diag along
                                    their longest PCA / world axis (median
                                    split). Mixed results — see section.
         [--split-worst-max <int>]  cap on splits (default 32)
+    [--repair-bad-slabs <f>]       final collision repair: split medium slab
+                                   OBBs with protrusion > f × diag, and trim
+                                   one-face slab OBBs with synthetic OBB
+                                   sub-triangles. Try 0.025–0.035.
+        [--repair-bad-slabs-max <int>] cap on repaired slabs (default 32)
+    [--post-merge-budget <n>]      final gated compression pass to n primitives
+        [--post-merge-hausdorff <f>] accept only merges whose sampled
+                                   primitive→input and input→primitive
+                                   local error stay below f × diag.
+    [--shrink-high-error <f>]      final collision-oriented OBB shrink pass
+                                   for high-error OBBs above f × diag.
+        [--split-error-region]     also try cuts derived from the farthest
+                                   sampled primitive→input error point.
+                                   Implies --split-worst 0.05 if omitted.
+        [--debug-splits <jsonl>]   write per-candidate split scores.
+                                   Implies --split-worst 0.05 if omitted.
+        [--debug-primitive <id>]   restrict --debug-splits to one viewer /
+                                   metrics primitive id.
     [--cull-overlap <f>]           experimental: drop any primitive A whose
                                    ≥f fraction of surface samples lie inside
                                    another primitive B (with A.vol ≤ B.vol).
                                    Largely a no-op on hollow architecture
                                    (true overlap is rare) — see section.
+    [--collision-simplify <f>]     collision-oriented simplification: prefer
+                                   cleaner primitive types while merging and
+                                   drop supported thin/small leftovers within
+                                   f × diag. Try 0.005–0.01.
+        [--collision-target-scale <f>]  merge to target_n × f before cleanup
+                                   when --collision-simplify is enabled.
+        [--collision-ignore-detail <f>] ignore small/detail face vertices
+                                   during merged collision fitting when
+                                   larger support faces are present. Try
+                                   0.001–0.005 for triangulated architecture.
+        [--collision-support-planes <f>] detect broad support planes and project
+                                   nearby visual-detail faces onto those planes
+                                   during merged collision fitting. Try 0.003–0.005.
+    [--outside-space <f>]          experimental outward-space guard: rejects
+                                   outward merge drift > f × diag and makes
+                                   split/refine optimize outward protrusion.
+        [--outside-fit <beta>]     experimental: during merge-time refit,
+                                   prefer candidate orientations/types with
+                                   less outward protrusion. Requires
+                                   --outside-space. Try 0.75–1.0.
     [--axis-align]                 experimental: lock primitive orientations
                                    to mesh-dominant axes. Hurts more meshes
                                    than it helps — see section.
@@ -101,6 +143,9 @@ cargo run --release -- input.glb 256 colliders.obj --empty-space
 The viewer is a single self-contained HTML file using three.js from a CDN.
 Drag = orbit, right-drag = pan, wheel = zoom, R = reset. Side-by-side and
 overlay layouts are toggleable; per-kind primitive visibility is toggleable.
+For debugging, add `?highlight=<primitive-id>` to emphasize a primitive;
+`&solo=1` hides every other primitive and `&ui=0` hides viewer controls for
+clean screenshots.
 
 ## Eval workflow
 
@@ -114,9 +159,22 @@ A fast iterate-and-validate loop:
 # 2. Headless screenshot of the viewer (uses macOS Chrome)
 ./scripts/screenshot.sh viewer.html out.png 1920 1080
 
+# Windows PowerShell (uses Chrome or Edge)
+.\scripts\screenshot.ps1 viewer.html out.png 1920 1080
+
 # Multi-angle (iso/front/back/left/right/top/bottom, montaged 4×2;
 # requires ImageMagick)
 ./scripts/screenshot.sh viewer.html out.png 1280 720 --multi
+
+# Windows multi-angle (no ImageMagick required)
+.\scripts\screenshot.ps1 viewer.html out.png 1280 720 --multi
+
+# Windows highlighted primitive debug montage
+.\scripts\screenshot.ps1 viewer.html worst.png 1280 720 --multi --highlight 867
+
+# Split candidate diagnostics for a highlighted primitive
+.\target\release\cpd.exe input.glb 256 out.obj `
+    --split-error-region --debug-splits split-debug.jsonl --debug-primitive 867
 ```
 
 `metrics.json` carries per-run quantitative numbers (Hausdorff, Chamfer,
@@ -139,8 +197,12 @@ handles images (including agentic tooling).
 | §4.4 | One-way Hausdorff / Chamfer evaluation metrics | ✓ |
 | ext. | Reverse Hausdorff (input → primitive surface) + coverage fraction | ✓ |
 | ext. | Merge-time feasibility check (rejects slab merges, paper §3.3 unsolved) | ✓ |
+| ext. | Oversized-face subdivision prepass (experimental) | ✓ |
 | ext. | Post-merge split-worst pass (experimental, mixed results) | ✓ |
+| ext. | Farthest-error-guided split-worst candidates (experimental) | ✓ |
+| ext. | Final bad slab OBB split/trim repair (experimental) | ✓ |
 | ext. | Partial-overlap cull (experimental — no-op on hollow architecture) | ✓ |
+| ext. | Collision detail simplification (experimental) | ✓ |
 | ext. | Axis-aligned OBB constraint (experimental — usually regresses) | ✓ |
 | ext. | Local-search OBB-orientation refine (Park & Sung-inspired) | ✓ |
 
@@ -572,6 +634,135 @@ handles images (including agentic tooling).
   same status as `--rebalance` — kept as an experimental option
   and as scaffolding for those follow-ups.
 
+  `--split-error-region` is the first targeted follow-up. It keeps the
+  baseline split candidates above, then also finds the primitive-surface
+  sample with the largest primitive→input distance and tries asymmetric
+  cuts that isolate faces near / beyond that error region: quantile cuts
+  along the error vector, nearest input normal, OBB/prism axes, localized
+  nearest-face clusters, and OBB/prism footprint k-means splits around the
+  unsupported corner. It is opt-in because it can create
+  less-topological face groups, but it directly targets the roof/side
+  OBB case where a rectangular primitive's unsupported corner drives the
+  metric. `--split-error-region` implies `--split-worst 0.05` if no
+  split threshold was supplied.
+
+  `--debug-splits <path.jsonl>` records every evaluated split candidate
+  as one JSON object per line: candidate source, primitive id, face
+  counts, original / split Hausdorff, volume deltas, primitive kinds,
+  witness point, and whether the candidate was accepted. Use
+  `--debug-primitive <id>` with the worst primitive id from metrics /
+  viewer highlight to keep the file focused.
+
+- **Bad slab repair (experimental, `--repair-bad-slabs <f>`).** This is a
+  final collision-specific pass that runs after split/refine and before
+  collision cleanup. It only considers medium-sized slab-like OBBs whose
+  dense sampled primitive→input or outside-space error exceeds `f × diag`.
+  For multi-face slabs it tries the same farthest-error footprint/corner cuts
+  as `--split-error-region`, but with stricter volume and improvement checks.
+
+  For one-face triangular slab OBBs, there is no face set to split. In that
+  case the pass can replace the bad OBB with OBB-only synthetic sub-triangle
+  pieces. Very small face-count slabs can also be midpoint-subdivided into
+  synthetic OBB pieces when ordinary face-set splits leave one large triangular
+  slab behind. This keeps `--no-prism` collision runs OBB-only while removing
+  the worst unused rectangle corners from large triangular roof or wall faces.
+  `--repair-bad-slabs-max <n>` caps the number of repaired source slabs.
+
+- **Post-merge budget compression (experimental,
+  `--post-merge-budget <n>`).** This final pass is for hard primitive budgets
+  after split/refine/repair have produced a high-quality but over-budget
+  decomposition. It greedily merges live primitives until the requested budget
+  is reached, but only accepts a candidate when sampled primitive→input error,
+  sampled input→primitive surface error over the merged source faces, and the
+  existing outside-space guard all stay within `--post-merge-hausdorff <f>`
+  (defaulting to the repair or split threshold when omitted).
+
+  This is useful for collision budgets where a few percent more Hausdorff is
+  acceptable but thick wrapper boxes are not. The reverse local gate is
+  intentionally there to avoid merges that look good from the primitive surface
+  but leave source faces deep inside a large OBB.
+
+  `--shrink-high-error <f>` is a final collision-oriented escape hatch for
+  already-budgeted OBBs that still protrude slightly. It tries small half-extent
+  reductions and keeps only dense sampled primitive→input improvements. This
+  can trade strict containment for lower Hausdorff, so verify coverage with
+  metrics when using it.
+
+- **Collision detail simplification (experimental, `--collision-simplify <f>`).**
+  This is intentionally not a visual-surface-fidelity objective. During fitting
+  and merging, it prefers cleaner primitive families when their volume is close,
+  and biases thin/small detail to merge into adjacent larger shapes. After
+  decomposition, it also removes thin/small primitives when most of their
+  sampled surface lies within `f × diag` of a larger live primitive. The target
+  is collision noise: trim bands, bevels, shallow protrusions, decorative rails,
+  and similar pieces that the normal Hausdorff/volume objective tries to
+  preserve even though a coarser nearby collider is sufficient.
+
+  Larger values are more aggressive and can reduce coverage, so treat this as
+  an art-direction knob rather than a universal metric optimizer.
+
+  `--collision-target-scale <f>` is a separate opt-in budget knob. With
+  collision simplification enabled, values below 1 continue the merge loop past
+  the requested visual target before cleanup; for example, `target_n=256` with
+  `--collision-target-scale 0.5` merges to an effective collision target of
+  128. This is useful when a mesh still spends the full target budget on trim
+  and panel segmentation. On detail-heavy architecture, pairing it with
+  `--no-prism` can also avoid triangular roof/brace primitives that look good
+  visually but are noisy as collision.
+
+  `--collision-ignore-detail <f>` makes this more explicit: faces whose
+  `sqrt(area)` is below `f × diag` are treated as detail for fitting. They
+  still participate in adjacency and can exist as standalone pieces, but once
+  they merge into a primitive that has larger support faces, their vertices no
+  longer expand the fitted collider. This is intended for windows, bevels,
+  trim strips, and inset panels where a flat wall/roof collision proxy is more
+  useful than preserving every visual step. On heavily triangulated meshes,
+  values above about `0.005` can classify too much real support geometry as
+  detail.
+
+  `--collision-support-planes <f>` is a less raw version of the same idea. It
+  first clusters broad coplanar-ish face regions into support planes, then
+  treats nearby non-support faces as detail if they are parallel to the support
+  plane or small enough to read as trim. Those detail faces still contribute
+  projected proxy points on the support plane, so the fit can flatten windows,
+  bevel lips, and inset strips without deleting their coverage entirely. The
+  value is a plane-distance fraction of the mesh diagonal.
+
+- **Outside-space guard (experimental, `--outside-space <f>`).**
+  This is a merge-time guard for collision runs where protruding outside the
+  source envelope is worse than leaving small interior gaps. It samples the
+  candidate primitive surface, queries the nearest input face, and rejects the
+  merge when the positive signed distance is greater than `f × diag`.
+
+  When `--split-worst` / `--refine-search` are also active, the same threshold
+  is folded into their scoring as `max(abs_hausdorff / split_threshold,
+  outside / outside_threshold)`, so post-merge repair can prefer a split or
+  orientation change that specifically reduces outward protrusion.
+
+  `--outside-fit <beta>` pushes this signal earlier into merge-time refit.
+  Candidate orientations/types are scored as
+  `base_score × (1 + beta × outside / outside_threshold)`, so a slightly
+  larger primitive can beat a smaller one when it protrudes less. On the
+  building test, beta `0.75–1.0` improved forward/reverse error; stronger
+  values over-optimised outside-space and reduced coverage.
+
+  This assumes the source mesh has mostly outward triangle winding. If the
+  source normals are inconsistent or inverted, prefer the normal absolute
+  `--feasibility` check instead.
+
+- **Oversized-face subdivision (experimental, `--subdivide-bad-faces <f>`).**
+  Before adjacency/decomposition, score each input triangle by fitting the
+  same one-face primitive the normal pipeline would start with, then measuring
+  dense primitive→input Hausdorff. If that score exceeds `f × diag`, replace
+  the triangle with three triangles that share a new centroid. This preserves
+  the original boundary edges, avoiding T-junctions against neighboring
+  unsplit faces, while giving the solver smaller units for huge planar
+  triangles whose own OBB already protrudes past the input silhouette.
+
+  The default depth is 1 because deeper subdivision can improve forward
+  Hausdorff slightly but may reduce coverage at the same target primitive
+  count. Use `--subdivide-bad-faces-max-depth <n>` for research sweeps.
+
 - **Iterative face-rebalance (experimental, `--rebalance`).** After the
   greedy merge completes, run Lloyd-style face migration: for each
   boundary face, try moving it to each adjacent primitive; accept the
@@ -733,8 +924,8 @@ handles images (including agentic tooling).
   optimisation that drops forward Hausdorff but also drops primitive
   count.
 
-  `scripts/screenshot.sh` headlessly renders the viewer to PNG so an
-  agent can visually validate without a GUI.
+  `scripts/screenshot.sh` and `scripts/screenshot.ps1` headlessly render
+  the viewer to PNG so an agent can visually validate without a GUI.
 
 ### Performance
 

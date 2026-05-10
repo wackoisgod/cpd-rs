@@ -42,7 +42,10 @@ pub fn write_viewer(path: &Path, mesh: &Mesh, prims: &[Primitive]) -> Result<()>
         // Defensive: NaN / Inf in tessellated verts poisons three.js
         // BufferGeometry and breaks the entire scene render. Skip those
         // primitives so the rest of the scene shows up.
-        if verts.iter().any(|v| !v[0].is_finite() || !v[1].is_finite() || !v[2].is_finite()) {
+        if verts
+            .iter()
+            .any(|v| !v[0].is_finite() || !v[1].is_finite() || !v[2].is_finite())
+        {
             skipped_nan += 1;
             continue;
         }
@@ -131,6 +134,8 @@ const HTML_PREFIX: &str = r#"<!doctype html>
     width: 1px; background: #333; pointer-events: none; z-index: 5;
   }
   body.split #divider, body.split #pane-label-left, body.split #pane-label-right { display: block; }
+  body.clean #ui, body.clean #help, body.clean .pane-label,
+  body.clean #pane-label-left, body.clean #pane-label-right { display: none !important; }
 </style>
 </head>
 <body>
@@ -158,8 +163,8 @@ const HTML_PREFIX: &str = r#"<!doctype html>
   <hr>
   <div id="stats"></div>
 </div>
-<div id="pane-label-left">input</div>
-<div id="pane-label-right">primitives</div>
+<div id="pane-label-left" class="pane-label">input</div>
+<div id="pane-label-right" class="pane-label">primitives</div>
 <div id="divider"></div>
 <div id="help">drag = orbit · right-drag = pan · wheel = zoom · R = reset</div>
 
@@ -179,6 +184,20 @@ const HTML_SUFFIX: &str = r#"</script>
 <script type="module">
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+
+const params = new URLSearchParams(window.location.search);
+if (params.get('ui') === '0' || params.get('clean') === '1') {
+  document.body.classList.add('clean');
+}
+const highlightIds = new Set(
+  (params.get('highlight') || '')
+    .split(',')
+    .map(s => Number.parseInt(s.trim(), 10))
+    .filter(Number.isFinite)
+);
+const hasHighlight = highlightIds.size > 0;
+const soloHighlight = params.get('solo') === '1';
+const dimHighlightContext = hasHighlight && params.get('dim') !== '0' && !soloHighlight;
 
 const data = JSON.parse(document.getElementById('cpd-data').textContent);
 
@@ -243,7 +262,7 @@ const bb = inputGeom.boundingBox;
 const center = bb.getCenter(new THREE.Vector3());
 const size = bb.getSize(new THREE.Vector3());
 const maxDim = Math.max(size.x, size.y, size.z);
-const angle = new URLSearchParams(window.location.search).get('angle') || 'iso';
+const angle = params.get('angle') || 'iso';
 const angles = {
   iso:    new THREE.Vector3(1.5, 0.8, 1.5),
   front:  new THREE.Vector3(0.0, 0.2, 1.8),
@@ -275,12 +294,28 @@ for (const p of data.primitives) {
   g.setAttribute('position', new THREE.Float32BufferAttribute(p.vertices, 3));
   g.setIndex(p.indices);
   g.computeVertexNormals();
+  const highlighted = highlightIds.has(p.id);
   const mat = new THREE.MeshStandardMaterial({
-    color: KIND_COLORS[p.kind] ?? 0xffffff,
-    transparent: true, opacity: 0.8, side: THREE.DoubleSide,
+    color: highlighted ? 0xff3b30 : (KIND_COLORS[p.kind] ?? 0xffffff),
+    emissive: highlighted ? 0x441100 : 0x000000,
+    transparent: true,
+    opacity: highlighted ? 1.0 : (dimHighlightContext ? 0.18 : 0.8),
+    side: THREE.DoubleSide,
+    depthWrite: !highlighted,
   });
   const mesh = new THREE.Mesh(g, mat);
-  mesh.userData = { id: p.id, kind: p.kind, volume: p.volume };
+  mesh.userData = { id: p.id, kind: p.kind, volume: p.volume, highlighted };
+  mesh.visible = !soloHighlight || highlighted;
+  if (highlighted) {
+    mesh.renderOrder = 10;
+    const edgeGeom = new THREE.EdgesGeometry(g, 1);
+    const edgeMat = new THREE.LineBasicMaterial({
+      color: 0xffffff, transparent: true, opacity: 0.95, depthTest: false,
+    });
+    const edges = new THREE.LineSegments(edgeGeom, edgeMat);
+    edges.renderOrder = 11;
+    mesh.add(edges);
+  }
   kindGroups[p.kind].add(mesh);
   primKindCounts[p.kind] = (primKindCounts[p.kind] ?? 0) + 1;
 }
@@ -318,7 +353,9 @@ document.getElementById('input-opacity').addEventListener('input', e => {
 });
 document.getElementById('prim-opacity').addEventListener('input', e => {
   for (const k of Object.keys(KIND_COLORS)) {
-    for (const m of kindGroups[k].children) m.material.opacity = e.target.value / 100;
+    for (const m of kindGroups[k].children) {
+      if (!m.userData.highlighted) m.material.opacity = e.target.value / 100;
+    }
   }
 });
 
@@ -326,7 +363,10 @@ document.getElementById('prim-opacity').addEventListener('input', e => {
 const stats = document.getElementById('stats');
 const triCount = data.input.indices.length / 3;
 const primTotal = data.primitives.length;
-stats.textContent = `${data.input.vertices.length / 3} verts · ${triCount} tris · ${primTotal} primitives`;
+const highlightText = hasHighlight
+  ? ` · highlight ${Array.from(highlightIds).map(id => `#${id}`).join(',')}`
+  : '';
+stats.textContent = `${data.input.vertices.length / 3} verts · ${triCount} tris · ${primTotal} primitives${highlightText}`;
 
 // keyboard: R resets the camera
 window.addEventListener('keydown', e => {

@@ -7,7 +7,7 @@
 
 use crate::bvh::Bvh;
 use crate::decomp::Primitive;
-use crate::mesh::{aabb, aabb_diag, Mesh};
+use crate::mesh::{Mesh, aabb, aabb_diag};
 use crate::prim;
 use nalgebra::{Point3, Vector3};
 
@@ -64,7 +64,12 @@ impl Metrics {
         format!(
             "metrics:\n  primitives:        {}  (obb={} sphere={} cyl={} cap={} frustum={} prism={})\n  total volume:      {:.4}\n  aabb volume:       {:.4}  ({:.1}% ratio)\n  hausdorff fwd:     {:.5}  ({:.4}% of diag)   [primitive→input, paper §4.4]\n  chamfer   fwd:     {:.5}  ({:.4}% of diag)\n  hausdorff rev:     {:.5}  ({:.4}% of diag)   [input→primitive surf, gap detector]\n  chamfer   rev:     {:.5}  ({:.4}% of diag)\n  hausdorff 2-way:   {:.5}  ({:.4}% of diag)   [max of fwd/rev — honest number]\n  chamfer   2-way:   {:.5}  ({:.4}% of diag)\n  coverage fraction: {:.4}                       [frac of input pts inside any primitive]\n  worst primitive:   #{} {:?}, max-sample-dist {:.4}, vol {:.4}\n  samples used:      {}",
             self.n_primitives,
-            by[0], by[1], by[2], by[3], by[4], by[5],
+            by[0],
+            by[1],
+            by[2],
+            by[3],
+            by[4],
+            by[5],
             self.total_volume,
             self.aabb_volume,
             100.0 * self.volume_ratio,
@@ -91,10 +96,23 @@ impl Metrics {
 
     pub fn json(&self) -> String {
         let by = self.by_kind;
+        let worst_kind = match self.worst_prim_kind {
+            prim::PrimKind::Obb => "obb",
+            prim::PrimKind::Sphere => "sphere",
+            prim::PrimKind::Cylinder => "cylinder",
+            prim::PrimKind::Capsule => "capsule",
+            prim::PrimKind::Frustum => "frustum",
+            prim::PrimKind::Prism => "prism",
+        };
         format!(
-            r#"{{"primitives":{},"by_kind":{{"obb":{},"sphere":{},"cylinder":{},"capsule":{},"frustum":{},"prism":{}}},"total_volume":{},"aabb_volume":{},"volume_ratio":{},"hausdorff":{},"hausdorff_norm":{},"chamfer":{},"chamfer_norm":{},"reverse_hausdorff":{},"reverse_hausdorff_norm":{},"reverse_chamfer":{},"reverse_chamfer_norm":{},"hausdorff_2way":{},"hausdorff_2way_norm":{},"chamfer_2way":{},"chamfer_2way_norm":{},"coverage_fraction":{},"samples":{}}}"#,
+            r#"{{"primitives":{},"by_kind":{{"obb":{},"sphere":{},"cylinder":{},"capsule":{},"frustum":{},"prism":{}}},"total_volume":{},"aabb_volume":{},"volume_ratio":{},"hausdorff":{},"hausdorff_norm":{},"chamfer":{},"chamfer_norm":{},"reverse_hausdorff":{},"reverse_hausdorff_norm":{},"reverse_chamfer":{},"reverse_chamfer_norm":{},"hausdorff_2way":{},"hausdorff_2way_norm":{},"chamfer_2way":{},"chamfer_2way_norm":{},"coverage_fraction":{},"worst_primitive":{{"id":{},"kind":"{}","max":{},"volume":{}}},"samples":{}}}"#,
             self.n_primitives,
-            by[0], by[1], by[2], by[3], by[4], by[5],
+            by[0],
+            by[1],
+            by[2],
+            by[3],
+            by[4],
+            by[5],
             self.total_volume,
             self.aabb_volume,
             self.volume_ratio,
@@ -111,6 +129,10 @@ impl Metrics {
             self.chamfer_2way,
             self.chamfer_2way_norm,
             self.coverage_fraction,
+            self.worst_prim_idx,
+            worst_kind,
+            self.worst_prim_max,
+            self.worst_prim_volume,
             self.samples,
         )
     }
@@ -120,9 +142,12 @@ impl Metrics {
 /// surface sampling; not for cryptography.
 struct Lcg(u64);
 impl Lcg {
-    fn new(seed: u64) -> Self { Self(seed.wrapping_mul(6364136223846793005).wrapping_add(1)) }
+    fn new(seed: u64) -> Self {
+        Self(seed.wrapping_mul(6364136223846793005).wrapping_add(1))
+    }
     fn step(&mut self) -> u32 {
-        self.0 = self.0
+        self.0 = self
+            .0
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
         (self.0 >> 32) as u32
@@ -136,8 +161,7 @@ impl Lcg {
 pub fn compute(prims: &[Primitive], mesh: &Mesh, n_samples: u32) -> Metrics {
     let bvh = Bvh::build(&mesh.verts, &mesh.tris);
     let (lo, hi) = aabb(&mesh.verts);
-    let aabb_volume =
-        ((hi.x - lo.x) * (hi.y - lo.y) * (hi.z - lo.z)).max(1e-12);
+    let aabb_volume = ((hi.x - lo.x) * (hi.y - lo.y) * (hi.z - lo.z)).max(1e-12);
     let diag = aabb_diag(&mesh.verts).max(1e-12);
 
     // Tessellate each live primitive and gather (verts, tris, per-tri area)
@@ -172,7 +196,9 @@ pub fn compute(prims: &[Primitive], mesh: &Mesh, n_samples: u32) -> Metrics {
         // hits. Sanitize per-tri area to 0 if non-finite — primitives
         // with broken tessellations contribute nothing rather than
         // poisoning the metric.
-        let any_nan_vert = verts.iter().any(|v| !v[0].is_finite() || !v[1].is_finite() || !v[2].is_finite());
+        let any_nan_vert = verts
+            .iter()
+            .any(|v| !v[0].is_finite() || !v[1].is_finite() || !v[2].is_finite());
         let (verts, tris) = if any_nan_vert {
             (Vec::new(), Vec::new())
         } else {
@@ -181,9 +207,21 @@ pub fn compute(prims: &[Primitive], mesh: &Mesh, n_samples: u32) -> Metrics {
         let mut cum = Vec::with_capacity(tris.len());
         let mut acc = 0.0f32;
         for t in &tris {
-            let a = Vector3::new(verts[t[0] as usize][0], verts[t[0] as usize][1], verts[t[0] as usize][2]);
-            let b = Vector3::new(verts[t[1] as usize][0], verts[t[1] as usize][1], verts[t[1] as usize][2]);
-            let c = Vector3::new(verts[t[2] as usize][0], verts[t[2] as usize][1], verts[t[2] as usize][2]);
+            let a = Vector3::new(
+                verts[t[0] as usize][0],
+                verts[t[0] as usize][1],
+                verts[t[0] as usize][2],
+            );
+            let b = Vector3::new(
+                verts[t[1] as usize][0],
+                verts[t[1] as usize][1],
+                verts[t[1] as usize][2],
+            );
+            let c = Vector3::new(
+                verts[t[2] as usize][0],
+                verts[t[2] as usize][1],
+                verts[t[2] as usize][2],
+            );
             let mut area = 0.5 * (b - a).cross(&(c - a)).norm();
             if !area.is_finite() {
                 area = 0.0;
@@ -375,8 +413,7 @@ pub fn compute(prims: &[Primitive], mesh: &Mesh, n_samples: u32) -> Metrics {
                     a.y * w + b.y * u + c.y * v,
                     a.z * w + b.z * u + c.z * v,
                 );
-                let (_pt, _n, signed) =
-                    prim_bvh.nearest_face(&prim_bvh_verts, &prim_bvh_tris, p);
+                let (_pt, _n, signed) = prim_bvh.nearest_face(&prim_bvh_verts, &prim_bvh_tris, p);
                 let d = signed.abs();
                 if d > reverse_max {
                     reverse_max = d;

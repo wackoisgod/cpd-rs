@@ -12,7 +12,10 @@ pub fn load_glb(path: &Path) -> Result<Mesh> {
     let (doc, buffers, _images) =
         gltf::import(path).with_context(|| format!("loading {}", path.display()))?;
 
-    let mut out = Mesh { verts: Vec::new(), tris: Vec::new() };
+    let mut out = Mesh {
+        verts: Vec::new(),
+        tris: Vec::new(),
+    };
     let scene = doc
         .default_scene()
         .or_else(|| doc.scenes().next())
@@ -160,11 +163,7 @@ pub fn build_adjacency(tris: &[[u32; 3]]) -> Adjacency {
 /// PCA. Down-weighting buried faces in Q and filtering them out of PCA
 /// makes the orientation reflect the visible shell, while containment
 /// fitting still uses every subsumed vertex (paper enclosure guarantee).
-pub fn compute_face_exposure(
-    mesh: &Mesh,
-    bvh: &crate::bvh::Bvh,
-    n_dirs: usize,
-) -> Vec<f32> {
+pub fn compute_face_exposure(mesh: &Mesh, bvh: &crate::bvh::Bvh, n_dirs: usize) -> Vec<f32> {
     let nf = mesh.tris.len();
     let diag = aabb_diag(&mesh.verts).max(1.0);
     let max_dist = diag * 0.5;
@@ -384,7 +383,12 @@ pub fn build_proximity_edges(
     for i in 0..summary.n {
         let mut dists: Vec<(usize, f32)> = (0..summary.n)
             .filter(|&j| j != i)
-            .map(|j| (j, aabb_to_aabb_distance(&summary.aabbs[i], &summary.aabbs[j])))
+            .map(|j| {
+                (
+                    j,
+                    aabb_to_aabb_distance(&summary.aabbs[i], &summary.aabbs[j]),
+                )
+            })
             .collect();
         dists.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
 
@@ -405,8 +409,8 @@ pub fn build_proximity_edges(
             let mut best: (u32, u32, f32) = (faces_i[0], faces_j[0], f32::INFINITY);
             for &fi in faces_i {
                 for &fj in faces_j {
-                    let dd = (face_centroid[fi as usize] - face_centroid[fj as usize])
-                        .norm_squared();
+                    let dd =
+                        (face_centroid[fi as usize] - face_centroid[fj as usize]).norm_squared();
                     if dd < best.2 {
                         best = (fi, fj, dd);
                     }
@@ -424,10 +428,7 @@ pub fn build_proximity_edges(
     edges.into_iter().map(|(k, _)| k).collect()
 }
 
-fn aabb_to_aabb_distance(
-    a: &(Point3<f32>, Point3<f32>),
-    b: &(Point3<f32>, Point3<f32>),
-) -> f32 {
+fn aabb_to_aabb_distance(a: &(Point3<f32>, Point3<f32>), b: &(Point3<f32>, Point3<f32>)) -> f32 {
     let mut d2 = 0.0f32;
     for i in 0..3 {
         let gap = if a.1[i] < b.0[i] {

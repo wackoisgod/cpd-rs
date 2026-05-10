@@ -8,6 +8,7 @@ mod prim;
 mod viewer;
 
 use anyhow::{Context, Result};
+use nalgebra::Point3;
 use prim::PrimMask;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -29,10 +30,23 @@ struct CliArgs {
     weighted_cost: bool,
     rebalance: Option<usize>,
     reject_pancakes: bool,
+    subdivide_bad_faces: Option<(f32, usize)>,
     strip_thin_obbs: Option<f32>,
     feasibility: Option<f32>,
+    outside_space: Option<f32>,
+    outside_fit_beta: f32,
     split_worst: Option<(f32, usize)>,
+    repair_bad_slabs: Option<(f32, usize)>,
+    post_merge_budget: Option<(usize, f32)>,
+    shrink_high_error: Option<f32>,
+    split_error_region: bool,
+    split_debug_json: Option<PathBuf>,
+    split_debug_primitive: Option<u32>,
     cull_overlap: Option<f32>,
+    collision_simplify: Option<f32>,
+    collision_target_scale: Option<f32>,
+    collision_ignore_detail: Option<f32>,
+    collision_support_planes: Option<f32>,
     axis_align: bool,
     world_axis_align: bool,
     refine_search: Option<(f32, usize)>,
@@ -56,10 +70,24 @@ fn parse_args() -> Result<CliArgs> {
     let mut weighted_cost = false;
     let mut rebalance: Option<usize> = None;
     let mut reject_pancakes = false;
+    let mut subdivide_bad_faces: Option<(f32, usize)> = None;
     let mut strip_thin_obbs: Option<f32> = None;
     let mut feasibility: Option<f32> = None;
+    let mut outside_space: Option<f32> = None;
+    let mut outside_fit_beta: f32 = 0.0;
     let mut split_worst: Option<(f32, usize)> = None;
+    let mut repair_bad_slabs: Option<(f32, usize)> = None;
+    let mut post_merge_budget: Option<usize> = None;
+    let mut post_merge_hausdorff: Option<f32> = None;
+    let mut shrink_high_error: Option<f32> = None;
+    let mut split_error_region = false;
+    let mut split_debug_json: Option<PathBuf> = None;
+    let mut split_debug_primitive: Option<u32> = None;
     let mut cull_overlap: Option<f32> = None;
+    let mut collision_simplify: Option<f32> = None;
+    let mut collision_target_scale: Option<f32> = None;
+    let mut collision_ignore_detail: Option<f32> = None;
+    let mut collision_support_planes: Option<f32> = None;
     let mut axis_align = false;
     let mut world_axis_align = false;
     let mut refine_search: Option<(f32, usize)> = None;
@@ -78,7 +106,10 @@ fn parse_args() -> Result<CliArgs> {
             }
             "--volume-threshold" => {
                 args.remove(0);
-                let v: String = args.first().cloned().context("--volume-threshold needs f32")?;
+                let v: String = args
+                    .first()
+                    .cloned()
+                    .context("--volume-threshold needs f32")?;
                 args.remove(0);
                 volume_threshold_frac = v.parse().context("not a float")?;
             }
@@ -96,7 +127,10 @@ fn parse_args() -> Result<CliArgs> {
             }
             "--quality" => {
                 args.remove(0);
-                let v = args.first().cloned().context("--quality needs a beta value")?;
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--quality needs a beta value")?;
                 args.remove(0);
                 quality_beta = v.parse().context("--quality beta must be f32")?;
             }
@@ -115,6 +149,28 @@ fn parse_args() -> Result<CliArgs> {
             "--reject-pancakes" => {
                 args.remove(0);
                 reject_pancakes = true;
+            }
+            "--subdivide-bad-faces" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--subdivide-bad-faces needs a threshold-frac-of-diag value")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                let prev_depth = subdivide_bad_faces.map(|(_, d)| d).unwrap_or(1);
+                subdivide_bad_faces = Some((f, prev_depth));
+            }
+            "--subdivide-bad-faces-max-depth" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--subdivide-bad-faces-max-depth needs an integer")?;
+                args.remove(0);
+                let depth: usize = v.parse().context("not an integer")?;
+                let prev_frac = subdivide_bad_faces.map(|(f, _)| f).unwrap_or(0.05);
+                subdivide_bad_faces = Some((prev_frac, depth));
             }
             "--strip-thin" => {
                 args.remove(0);
@@ -140,6 +196,25 @@ fn parse_args() -> Result<CliArgs> {
                 let f: f32 = v.parse().context("not a float")?;
                 feasibility = Some(f);
             }
+            "--outside-space" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--outside-space needs a max-frac-of-diag value")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                outside_space = Some(f);
+            }
+            "--outside-fit" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--outside-fit needs a beta value")?;
+                args.remove(0);
+                outside_fit_beta = v.parse().context("not a float")?;
+            }
             "--split-worst" => {
                 args.remove(0);
                 let v = args
@@ -162,6 +237,79 @@ fn parse_args() -> Result<CliArgs> {
                 let prev_frac = split_worst.map(|(f, _)| f).unwrap_or(0.05);
                 split_worst = Some((prev_frac, m));
             }
+            "--repair-bad-slabs" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--repair-bad-slabs needs a threshold-frac-of-diag value")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                let prev_max = repair_bad_slabs.map(|(_, m)| m).unwrap_or(32);
+                repair_bad_slabs = Some((f, prev_max));
+            }
+            "--repair-bad-slabs-max" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--repair-bad-slabs-max needs an integer")?;
+                args.remove(0);
+                let m: usize = v.parse().context("not an integer")?;
+                let prev_frac = repair_bad_slabs.map(|(f, _)| f).unwrap_or(0.03);
+                repair_bad_slabs = Some((prev_frac, m));
+            }
+            "--post-merge-budget" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--post-merge-budget needs a primitive count")?;
+                args.remove(0);
+                post_merge_budget = Some(v.parse().context("not an integer")?);
+            }
+            "--post-merge-hausdorff" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--post-merge-hausdorff needs a threshold-frac-of-diag value")?;
+                args.remove(0);
+                post_merge_hausdorff = Some(v.parse().context("not a float")?);
+            }
+            "--shrink-high-error" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--shrink-high-error needs a threshold-frac-of-diag value")?;
+                args.remove(0);
+                shrink_high_error = Some(v.parse().context("not a float")?);
+            }
+            "--split-error-region" => {
+                args.remove(0);
+                split_error_region = true;
+                split_worst = Some(split_worst.unwrap_or((0.05, 32)));
+            }
+            "--debug-splits" => {
+                args.remove(0);
+                let p = args
+                    .first()
+                    .cloned()
+                    .context("--debug-splits needs an output .jsonl path")?;
+                args.remove(0);
+                split_debug_json = Some(PathBuf::from(p));
+                split_worst = Some(split_worst.unwrap_or((0.05, 32)));
+            }
+            "--debug-primitive" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--debug-primitive needs a primitive id")?;
+                args.remove(0);
+                split_debug_primitive = Some(v.parse().context("not an integer")?);
+            }
             "--cull-overlap" => {
                 args.remove(0);
                 let v = args
@@ -171,6 +319,46 @@ fn parse_args() -> Result<CliArgs> {
                 args.remove(0);
                 let f: f32 = v.parse().context("not a float")?;
                 cull_overlap = Some(f);
+            }
+            "--collision-simplify" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--collision-simplify needs a tolerance-frac-of-diag value")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                collision_simplify = Some(f);
+            }
+            "--collision-target-scale" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--collision-target-scale needs a positive scale")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                collision_target_scale = Some(f);
+            }
+            "--collision-ignore-detail" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--collision-ignore-detail needs a feature-scale fraction")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                collision_ignore_detail = Some(f);
+            }
+            "--collision-support-planes" => {
+                args.remove(0);
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--collision-support-planes needs a plane-distance fraction")?;
+                args.remove(0);
+                let f: f32 = v.parse().context("not a float")?;
+                collision_support_planes = Some(f);
             }
             "--axis-align" => {
                 args.remove(0);
@@ -214,7 +402,10 @@ fn parse_args() -> Result<CliArgs> {
             }
             "--rebalance-passes" => {
                 args.remove(0);
-                let v = args.first().cloned().context("--rebalance-passes needs usize")?;
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--rebalance-passes needs usize")?;
                 args.remove(0);
                 rebalance = Some(v.parse().context("not an integer")?);
             }
@@ -241,7 +432,10 @@ fn parse_args() -> Result<CliArgs> {
             }
             "--proximity-angle" => {
                 args.remove(0);
-                let v = args.first().cloned().context("--proximity-angle needs degrees")?;
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--proximity-angle needs degrees")?;
                 args.remove(0);
                 let deg: f32 = v.parse().context("not a float")?;
                 let prev = proximity.unwrap_or((0.05, 2, std::f32::consts::FRAC_PI_4));
@@ -253,7 +447,10 @@ fn parse_args() -> Result<CliArgs> {
             }
             "--metrics-json" => {
                 args.remove(0);
-                let p = args.first().cloned().context("--metrics-json needs a path")?;
+                let p = args
+                    .first()
+                    .cloned()
+                    .context("--metrics-json needs a path")?;
                 args.remove(0);
                 metrics_json = Some(PathBuf::from(p));
                 metrics_flag = true;
@@ -267,7 +464,10 @@ fn parse_args() -> Result<CliArgs> {
             }
             "--empty-space-fraction" => {
                 args.remove(0);
-                let v = args.first().cloned().context("--empty-space-fraction needs f32")?;
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--empty-space-fraction needs f32")?;
                 args.remove(0);
                 let f: f32 = v.parse().context("not a float")?;
                 let prev = empty_space.unwrap_or((0.25, 0.01));
@@ -275,17 +475,35 @@ fn parse_args() -> Result<CliArgs> {
             }
             "--empty-space-distance" => {
                 args.remove(0);
-                let v = args.first().cloned().context("--empty-space-distance needs f32")?;
+                let v = args
+                    .first()
+                    .cloned()
+                    .context("--empty-space-distance needs f32")?;
                 args.remove(0);
                 let f: f32 = v.parse().context("not a float")?;
                 let prev = empty_space.unwrap_or((0.25, 0.01));
                 empty_space = Some((prev.0, f));
             }
-            "--no-sphere" => { args.remove(0); mask.sphere = false; }
-            "--no-cylinder" => { args.remove(0); mask.cylinder = false; }
-            "--no-capsule" => { args.remove(0); mask.capsule = false; }
-            "--no-frustum" => { args.remove(0); mask.frustum = false; }
-            "--no-prism" => { args.remove(0); mask.prism = false; }
+            "--no-sphere" => {
+                args.remove(0);
+                mask.sphere = false;
+            }
+            "--no-cylinder" => {
+                args.remove(0);
+                mask.cylinder = false;
+            }
+            "--no-capsule" => {
+                args.remove(0);
+                mask.capsule = false;
+            }
+            "--no-frustum" => {
+                args.remove(0);
+                mask.frustum = false;
+            }
+            "--no-prism" => {
+                args.remove(0);
+                mask.prism = false;
+            }
             "-h" | "--help" => {
                 print_usage();
                 std::process::exit(0);
@@ -301,8 +519,80 @@ fn parse_args() -> Result<CliArgs> {
         print_usage();
         anyhow::bail!("missing positional args");
     }
+    if split_debug_primitive.is_some() && split_debug_json.is_none() {
+        anyhow::bail!("--debug-primitive requires --debug-splits <path>");
+    }
+    if let Some((frac, depth)) = subdivide_bad_faces {
+        if frac <= 0.0 || !frac.is_finite() {
+            anyhow::bail!("--subdivide-bad-faces must be a positive finite fraction");
+        }
+        if depth == 0 {
+            anyhow::bail!("--subdivide-bad-faces-max-depth must be at least 1");
+        }
+    }
+    if let Some(frac) = collision_simplify {
+        if frac <= 0.0 || !frac.is_finite() {
+            anyhow::bail!("--collision-simplify must be a positive finite fraction");
+        }
+    }
+    if let Some(frac) = outside_space {
+        if frac <= 0.0 || !frac.is_finite() {
+            anyhow::bail!("--outside-space must be a positive finite fraction");
+        }
+    }
+    if let Some((frac, max_repairs)) = repair_bad_slabs {
+        if frac <= 0.0 || !frac.is_finite() {
+            anyhow::bail!("--repair-bad-slabs must be a positive finite fraction");
+        }
+        if max_repairs == 0 {
+            anyhow::bail!("--repair-bad-slabs-max must be at least 1");
+        }
+    }
+    if let Some(target) = post_merge_budget {
+        if target == 0 {
+            anyhow::bail!("--post-merge-budget must be at least 1");
+        }
+    }
+    if let Some(frac) = post_merge_hausdorff {
+        if frac <= 0.0 || !frac.is_finite() {
+            anyhow::bail!("--post-merge-hausdorff must be a positive finite fraction");
+        }
+        if post_merge_budget.is_none() {
+            anyhow::bail!("--post-merge-hausdorff requires --post-merge-budget <n>");
+        }
+    }
+    if let Some(frac) = shrink_high_error {
+        if frac <= 0.0 || !frac.is_finite() {
+            anyhow::bail!("--shrink-high-error must be a positive finite fraction");
+        }
+    }
+    if outside_fit_beta != 0.0 {
+        if outside_fit_beta <= 0.0 || !outside_fit_beta.is_finite() {
+            anyhow::bail!("--outside-fit must be a positive finite beta");
+        }
+        if outside_space.is_none() {
+            anyhow::bail!("--outside-fit requires --outside-space <f>");
+        }
+    }
+    if let Some(scale) = collision_target_scale {
+        if scale <= 0.0 || !scale.is_finite() {
+            anyhow::bail!("--collision-target-scale must be a positive finite scale");
+        }
+    }
+    if let Some(frac) = collision_ignore_detail {
+        if frac <= 0.0 || !frac.is_finite() {
+            anyhow::bail!("--collision-ignore-detail must be a positive finite fraction");
+        }
+    }
+    if let Some(frac) = collision_support_planes {
+        if frac <= 0.0 || !frac.is_finite() {
+            anyhow::bail!("--collision-support-planes must be a positive finite fraction");
+        }
+    }
     let mesh_path = PathBuf::from(&positional[0]);
-    let target_n: usize = positional[1].parse().context("target_n must be a positive integer")?;
+    let target_n: usize = positional[1]
+        .parse()
+        .context("target_n must be a positive integer")?;
     let out_obj = positional
         .get(2)
         .map(PathBuf::from)
@@ -311,6 +601,15 @@ fn parse_args() -> Result<CliArgs> {
     if obb_only {
         mask = PrimMask::obb_only();
     }
+    let post_merge_budget = post_merge_budget.map(|target| {
+        let threshold = post_merge_hausdorff.unwrap_or_else(|| {
+            repair_bad_slabs
+                .map(|(f, _)| f)
+                .or_else(|| split_worst.map(|(f, _)| f))
+                .unwrap_or(0.03)
+        });
+        (target, threshold)
+    });
 
     Ok(CliArgs {
         mesh_path,
@@ -328,10 +627,23 @@ fn parse_args() -> Result<CliArgs> {
         weighted_cost,
         rebalance,
         reject_pancakes,
+        subdivide_bad_faces,
         strip_thin_obbs,
         feasibility,
+        outside_space,
+        outside_fit_beta,
         split_worst,
+        repair_bad_slabs,
+        post_merge_budget,
+        shrink_high_error,
+        split_error_region,
+        split_debug_json,
+        split_debug_primitive,
         cull_overlap,
+        collision_simplify,
+        collision_target_scale,
+        collision_ignore_detail,
+        collision_support_planes,
         axis_align,
         world_axis_align,
         refine_search,
@@ -370,6 +682,12 @@ fn print_usage() {
                             architecture meshes with rooftops / wall
                             collisions; can hurt vehicles with long thin
                             panels at the same threshold.
+       [--subdivide-bad-faces <f>]  pre-decomp: recursively split a single
+                            triangle into 3 triangles when its initial
+                            one-face primitive has local Hausdorff > f × diag.
+                            Targets oversized planar triangles; default
+                            max depth 1.
+           [--subdivide-bad-faces-max-depth <int>]  override depth
        [--strip-thin]       paper appendix Fig 22 postprocess: after merge
                             + cull, delete any OBB whose smallest half-
                             extent ≤ 1e-4 × mesh_diag. Different from
@@ -383,6 +701,14 @@ fn print_usage() {
                             slab-merge failure mode (cost function can't
                             see surface drift). Try 0.05 to 0.15. Cost:
                             ~24 BVH queries per realized merge.
+       [--outside-space <f>]  reject any popped merge whose sampled surface
+                            is farther than f × diag on the outward signed
+                            side of the nearest input face; also biases
+                            split/refine toward reducing outward protrusion.
+                            Experimental; assumes mostly outward winding.
+       [--outside-fit <beta>] during merge-time refit, score candidate
+                            orientations/types with an outside-space penalty.
+                            Requires --outside-space. Try 1 to 3.
        [--split-worst <f>]  post-merge: repeatedly find the live primitive
                             with highest local Hausdorff > f × diag and
                             split it along the longest PCA axis (median
@@ -390,6 +716,24 @@ fn print_usage() {
                             split adds 1 primitive. Targets the OBB-on-
                             non-rectangular-region limit.
            [--split-worst-max <int>]  cap on splits (default 32)
+       [--repair-bad-slabs <f>] final collision repair: only medium
+                            slab-like OBBs with sampled protrusion > f × diag;
+                            tries corner/footprint splits, plus OBB-only
+                            sub-triangle trims for one-face slabs. Try
+                            0.025 to 0.035.
+           [--repair-bad-slabs-max <int>]  cap on repairs (default 32)
+       [--post-merge-budget <n>] final gated compression pass to n primitives
+           [--post-merge-hausdorff <f>] max accepted merge Hausdorff as f × diag
+       [--shrink-high-error <f>] final OBB shrink pass for primitives whose
+                            dense local Hausdorff remains above f × diag.
+           [--split-error-region]  opt-in repair mode for --split-worst:
+                            also try candidate splits derived from the
+                            primitive's farthest sampled error point.
+                            Implies --split-worst 0.05 if omitted.
+           [--debug-splits <path.jsonl>]  write per-candidate split scores.
+                            Implies --split-worst 0.05 if omitted.
+           [--debug-primitive <id>]  restrict --debug-splits to one viewer/
+                            metrics primitive id.
        [--axis-align]       lock all primitive orientations to the mesh's
                             dominant axes (eigendecomposition of global Q).
                             Eliminates the rotated-slab failure mode on
@@ -418,6 +762,20 @@ fn print_usage() {
                          hole-dominant meshes (mazes, towers, environments).
            [--empty-space-fraction <0..1>]   default 0.25
            [--empty-space-distance <frac-of-diag>]   default 0.01
+       [--collision-simplify <f>]  collision-oriented simplification: prefer
+                         cleaner primitive types during fitting/merging, bias
+                         thin detail to merge into nearby larger shapes, then
+                         drop supported thin/small leftovers within f × diag.
+           [--collision-target-scale <f>]  when collision simplification is
+                         enabled, merge to target_n × f before cleanup. Values
+                         below 1 trade detail fidelity for cleaner colliders.
+       [--collision-ignore-detail <f>]  collision fit vertices ignore faces
+                         whose sqrt(area) is below f × diag when a merged
+                         primitive also has larger support faces. Try 0.001-0.005.
+       [--collision-support-planes <f>]  detect broad support planes and project
+                         nearby detail faces onto them during collision fitting.
+                         The value is plane distance as a fraction of diag.
+                         Try 0.003-0.005.
        [--no-sphere | --no-cylinder | --no-capsule | --no-frustum | --no-prism]"
     );
 }
@@ -452,6 +810,26 @@ fn main() -> Result<()> {
         m.tris.len(),
     );
 
+    if let Some((threshold_frac, max_depth)) = args.subdivide_bad_faces {
+        let t = Instant::now();
+        let stats = subdivide_bad_faces(
+            &mut m,
+            threshold_frac,
+            max_depth,
+            args.enable_mask,
+            args.tangent_eps,
+        );
+        eprintln!(
+            "subdivide-bad-faces: split {} faces, +{} tris, max depth {}, now {} verts / {} tris ({:.1} ms)",
+            stats.split_faces,
+            stats.added_tris,
+            stats.max_depth_reached,
+            m.verts.len(),
+            m.tris.len(),
+            t.elapsed().as_secs_f64() * 1000.0,
+        );
+    }
+
     // AABB volume for the relative volume threshold knob.
     let (lo, hi) = mesh::aabb(&m.verts);
     let aabb_vol = ((hi.x - lo.x) * (hi.y - lo.y) * (hi.z - lo.z)).max(1e-12);
@@ -462,9 +840,7 @@ fn main() -> Result<()> {
     };
     eprintln!(
         "aabb volume {:.4}, volume-threshold {} → abs {}",
-        aabb_vol,
-        args.volume_threshold_frac,
-        abs_vol_threshold,
+        aabb_vol, args.volume_threshold_frac, abs_vol_threshold,
     );
 
     let t1 = Instant::now();
@@ -506,8 +882,24 @@ fn main() -> Result<()> {
             reject_pancakes: args.reject_pancakes,
             strip_thin_obbs: args.strip_thin_obbs,
             feasibility: args.feasibility,
+            outside_space: args.outside_space,
+            outside_fit_beta: args.outside_fit_beta,
             split_worst: args.split_worst,
+            repair_bad_slabs: args.repair_bad_slabs,
+            post_merge_budget: args.post_merge_budget,
+            shrink_high_error: args.shrink_high_error,
+            split_error_region: args.split_error_region,
+            debug_splits: args
+                .split_debug_json
+                .as_ref()
+                .map(|_| decomp::SplitDebugOpts {
+                    primitive: args.split_debug_primitive,
+                }),
             cull_overlap: args.cull_overlap,
+            collision_simplify: args.collision_simplify,
+            collision_target_scale: args.collision_target_scale,
+            collision_ignore_detail: args.collision_ignore_detail,
+            collision_support_planes: args.collision_support_planes,
             axis_align: args.axis_align,
             world_axis_align: args.world_axis_align,
             refine_search: args.refine_search,
@@ -524,21 +916,41 @@ fn main() -> Result<()> {
         .sum();
     let by_kind = count_by_kind(&result.primitives);
     eprintln!(
-        "merge: {:.1} ms, {} merges, {} stale, {} empty-rejected, {} feasibility-rejected, all-pairs={}, culled={}, overlap-culled={}, splits={}, thin-stripped={}, {} primitives, total vol {:.3}",
+        "merge: {:.1} ms, {} merges, {} stale, {} empty-rejected, {} feasibility-rejected, {} outside-rejected, all-pairs={}, culled={}, overlap-culled={}, post-budget-merges={}, collision-simplified={}, splits={}, slab-repairs={}, high-error-shrunk={}, thin-stripped={}, {} primitives, total vol {:.3}",
         merge_ms,
         result.merges_done,
         result.merges_skipped_stale,
         result.merges_rejected_empty,
         result.merges_rejected_feasibility,
+        result.merges_rejected_outside,
         result.all_pairs_used,
         result.redundant_culled,
         result.overlap_culled,
+        result.post_budget_merges,
+        result.collision_simplified,
         result.splits_done,
+        result.slab_repairs_done,
+        result.high_error_shrunk,
         result.thin_stripped,
         alive,
         total_vol,
     );
     eprintln!("by kind: {}", by_kind);
+
+    if let Some(path) = &args.split_debug_json {
+        let mut lines = String::new();
+        for row in &result.split_debug {
+            lines.push_str(&row.json_line());
+            lines.push('\n');
+        }
+        std::fs::write(path, lines)
+            .with_context(|| format!("writing split debug jsonl to {}", path.display()))?;
+        eprintln!(
+            "wrote {} split debug rows to {}",
+            result.split_debug.len(),
+            path.display()
+        );
+    }
 
     io_obj::write_obbs_obj(&args.out_obj, &result.primitives)?;
 
@@ -587,4 +999,94 @@ fn count_by_kind(prims: &[decomp::Primitive]) -> String {
         "obb={} sphere={} cyl={} cap={} frustum={} prism={}",
         counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
     )
+}
+
+struct SubdivideStats {
+    split_faces: usize,
+    added_tris: usize,
+    max_depth_reached: usize,
+}
+
+fn subdivide_bad_faces(
+    mesh: &mut mesh::Mesh,
+    threshold_frac: f32,
+    max_depth: usize,
+    enabled: PrimMask,
+    tangent_eps: f32,
+) -> SubdivideStats {
+    let start_tris = mesh.tris.len();
+    let reference = mesh::Mesh {
+        verts: mesh.verts.clone(),
+        tris: mesh.tris.clone(),
+    };
+    let bvh = bvh::Bvh::build(&reference.verts, &reference.tris);
+    let threshold = threshold_frac * mesh::aabb_diag(&reference.verts).max(1e-6);
+    let mut depths = vec![0usize; mesh.tris.len()];
+    let mut split_faces = 0usize;
+
+    for _ in 0..max_depth {
+        let mut changed = false;
+        let mut next_tris: Vec<[u32; 3]> = Vec::with_capacity(mesh.tris.len());
+        let mut next_depths: Vec<usize> = Vec::with_capacity(depths.len());
+
+        for (ti, tri) in mesh.tris.iter().copied().enumerate() {
+            let depth = depths[ti];
+            if depth >= max_depth {
+                next_tris.push(tri);
+                next_depths.push(depth);
+                continue;
+            }
+
+            let p0 = mesh.verts[tri[0] as usize];
+            let p1 = mesh.verts[tri[1] as usize];
+            let p2 = mesh.verts[tri[2] as usize];
+            let area2 = (p1 - p0).cross(&(p2 - p0)).norm();
+            if area2 < 1e-12 {
+                next_tris.push(tri);
+                next_depths.push(depth);
+                continue;
+            }
+
+            let h = decomp::single_triangle_dense_hausdorff(
+                p0,
+                p1,
+                p2,
+                &bvh,
+                &reference,
+                enabled,
+                tangent_eps,
+                None,
+            );
+            if h <= threshold {
+                next_tris.push(tri);
+                next_depths.push(depth);
+                continue;
+            }
+
+            let centroid = Point3::from((p0.coords + p1.coords + p2.coords) / 3.0);
+            let ci = mesh.verts.len() as u32;
+            mesh.verts.push(centroid);
+            let next_depth = depth + 1;
+            next_tris.push([tri[0], tri[1], ci]);
+            next_depths.push(next_depth);
+            next_tris.push([tri[1], tri[2], ci]);
+            next_depths.push(next_depth);
+            next_tris.push([tri[2], tri[0], ci]);
+            next_depths.push(next_depth);
+            split_faces += 1;
+            changed = true;
+        }
+
+        mesh.tris = next_tris;
+        depths = next_depths;
+        if !changed {
+            break;
+        }
+    }
+
+    SubdivideStats {
+        split_faces,
+        added_tris: mesh.tris.len().saturating_sub(start_tris),
+        max_depth_reached: depths.iter().copied().max().unwrap_or(0),
+    }
 }

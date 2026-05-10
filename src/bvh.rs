@@ -45,8 +45,16 @@ impl Bvh {
             };
             face_centroids.push(centroid);
             face_normals.push(normal);
-            let lo = [a.x.min(b.x).min(c.x), a.y.min(b.y).min(c.y), a.z.min(b.z).min(c.z)];
-            let hi = [a.x.max(b.x).max(c.x), a.y.max(b.y).max(c.y), a.z.max(b.z).max(c.z)];
+            let lo = [
+                a.x.min(b.x).min(c.x),
+                a.y.min(b.y).min(c.y),
+                a.z.min(b.z).min(c.z),
+            ];
+            let hi = [
+                a.x.max(b.x).max(c.x),
+                a.y.max(b.y).max(c.y),
+                a.z.max(b.z).max(c.z),
+            ];
             face_aabb_min.push(lo);
             face_aabb_max.push(hi);
         }
@@ -85,9 +93,21 @@ impl Bvh {
         }
         // pre-compute reciprocals for the slab test
         let inv_dir = Vector3::new(
-            if dir.x.abs() > 1e-20 { 1.0 / dir.x } else { f32::INFINITY },
-            if dir.y.abs() > 1e-20 { 1.0 / dir.y } else { f32::INFINITY },
-            if dir.z.abs() > 1e-20 { 1.0 / dir.z } else { f32::INFINITY },
+            if dir.x.abs() > 1e-20 {
+                1.0 / dir.x
+            } else {
+                f32::INFINITY
+            },
+            if dir.y.abs() > 1e-20 {
+                1.0 / dir.y
+            } else {
+                f32::INFINITY
+            },
+            if dir.z.abs() > 1e-20 {
+                1.0 / dir.z
+            } else {
+                f32::INFINITY
+            },
         );
         self.descend_ray(0, verts, tris, origin, dir, inv_dir, max_dist)
     }
@@ -147,7 +167,15 @@ impl Bvh {
         let mut best_pt = Point3::origin();
         let mut best_face: u32 = 0;
         if !self.nodes.is_empty() {
-            self.descend(0, verts, tris, query, &mut best_d2, &mut best_pt, &mut best_face);
+            self.descend(
+                0,
+                verts,
+                tris,
+                query,
+                &mut best_d2,
+                &mut best_pt,
+                &mut best_face,
+            );
         }
         let n = self.face_normals[best_face as usize];
         let signed = (query - best_pt).dot(&n);
@@ -285,8 +313,24 @@ fn build_recursive(
         count: 0,
         b: 0,
     });
-    let left = build_recursive(start, split, face_indices, face_centroids, face_aabb_min, face_aabb_max, nodes);
-    let right = build_recursive(split, end, face_indices, face_centroids, face_aabb_min, face_aabb_max, nodes);
+    let left = build_recursive(
+        start,
+        split,
+        face_indices,
+        face_centroids,
+        face_aabb_min,
+        face_aabb_max,
+        nodes,
+    );
+    let right = build_recursive(
+        split,
+        end,
+        face_indices,
+        face_centroids,
+        face_aabb_min,
+        face_aabb_max,
+        nodes,
+    );
     nodes[our_idx as usize].a = left;
     nodes[our_idx as usize].b = right;
     nodes[our_idx as usize].count = 0;
@@ -371,11 +415,7 @@ fn ray_triangle(
         return None;
     }
     let t = inv_det * edge2.dot(&q);
-    if t > 0.0 {
-        Some(t)
-    } else {
-        None
-    }
+    if t > 0.0 { Some(t) } else { None }
 }
 
 /// Ericson, "Real-Time Collision Detection". Returns the point on triangle

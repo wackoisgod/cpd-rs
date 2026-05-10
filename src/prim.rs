@@ -80,11 +80,7 @@ impl Prim {
                 min_h < clamped && max_h > 0.0 && min_h / max_h < ASPECT
             }
             Prim::Prism {
-                hx,
-                hy,
-                hzt,
-                hzb,
-                ..
+                hx, hy, hzt, hzb, ..
             } => {
                 let dims = [hx, hy, hzt, hzb];
                 let min_h = dims.iter().cloned().fold(f32::INFINITY, f32::min);
@@ -111,13 +107,15 @@ impl Prim {
 
     pub fn volume(&self) -> f32 {
         match *self {
-            Prim::Obb { half_extents: h, .. } => 8.0 * h[0] * h[1] * h[2],
+            Prim::Obb {
+                half_extents: h, ..
+            } => 8.0 * h[0] * h[1] * h[2],
             Prim::Sphere { r, .. } => (4.0 / 3.0) * PI * r * r * r,
             Prim::Cylinder { h, r, .. } => PI * r * r * h,
             Prim::Capsule { h, r, .. } => PI * r * r * h + (4.0 / 3.0) * PI * r * r * r,
-            Prim::Frustum { h, r_bot, r_top, .. } => {
-                (PI * h / 3.0) * (r_top * r_top + r_top * r_bot + r_bot * r_bot)
-            }
+            Prim::Frustum {
+                h, r_bot, r_top, ..
+            } => (PI * h / 3.0) * (r_top * r_top + r_top * r_bot + r_bot * r_bot),
             Prim::Prism {
                 hx, hy, hzt, hzb, ..
             } => 4.0 * hx * hy * (hzt + hzb),
@@ -762,11 +760,7 @@ pub fn fit_prism_best(
 /// All-candidate fit (no sphere skip), returns every primitive type as a
 /// Vec so the caller can apply a custom selection criterion (e.g. a
 /// Hausdorff-aware combined cost).
-pub fn fit_all(
-    axes: [Vector3<f32>; 3],
-    points: &[Point3<f32>],
-    enabled: PrimMask,
-) -> Vec<Prim> {
+pub fn fit_all(axes: [Vector3<f32>; 3], points: &[Point3<f32>], enabled: PrimMask) -> Vec<Prim> {
     let obb = fit_obb(axes, points);
     let obb_center = match &obb {
         Prim::Obb { center, .. } => *center,
@@ -807,11 +801,7 @@ pub fn fit_all(
 /// weighted volume. OBB is computed unconditionally because its centre
 /// seeds the sphere / cylinder / capsule fits, but it's only *eligible*
 /// to be returned when `enabled.obb == true`.
-pub fn fit_best(
-    axes: [Vector3<f32>; 3],
-    points: &[Point3<f32>],
-    enabled: PrimMask,
-) -> Prim {
+pub fn fit_best(axes: [Vector3<f32>; 3], points: &[Point3<f32>], enabled: PrimMask) -> Prim {
     let obb = fit_obb(axes, points);
     let obb_center = match &obb {
         Prim::Obb { center, .. } => *center,
@@ -934,12 +924,7 @@ pub fn world_aabb(prim: &Prim) -> ([f32; 3], [f32; 3]) {
             [center.x - r, center.y - r, center.z - r],
             [center.x + r, center.y + r, center.z + r],
         ),
-        Prim::Cylinder {
-            center,
-            axis,
-            h,
-            r,
-        } => {
+        Prim::Cylinder { center, axis, h, r } => {
             let half_h = h * 0.5;
             let mut lo = [0.0f32; 3];
             let mut hi = [0.0f32; 3];
@@ -951,12 +936,7 @@ pub fn world_aabb(prim: &Prim) -> ([f32; 3], [f32; 3]) {
             }
             (lo, hi)
         }
-        Prim::Capsule {
-            center,
-            axis,
-            h,
-            r,
-        } => {
+        Prim::Capsule { center, axis, h, r } => {
             // Tight AABB of the union of two spheres of radius r at the two
             // hemisphere centers.
             let half_h = h * 0.5;
@@ -1034,18 +1014,8 @@ pub fn tessellate(prim: &Prim) -> (Vec<[f32; 3]>, Vec<[u32; 3]>) {
             half_extents,
         } => box_mesh(center, axes, half_extents),
         Prim::Sphere { center, r } => sphere_mesh(center, r, 16, 12),
-        Prim::Cylinder {
-            center,
-            axis,
-            h,
-            r,
-        } => cylinder_mesh(center, axis, h, r, 24),
-        Prim::Capsule {
-            center,
-            axis,
-            h,
-            r,
-        } => capsule_mesh(center, axis, h, r, 24, 8),
+        Prim::Cylinder { center, axis, h, r } => cylinder_mesh(center, axis, h, r, 24),
+        Prim::Capsule { center, axis, h, r } => capsule_mesh(center, axis, h, r, 24, 8),
         Prim::Frustum {
             center,
             axis,
@@ -1074,7 +1044,10 @@ fn box_mesh(
         let sx = if k & 1 != 0 { 1.0 } else { -1.0 };
         let sy = if k & 2 != 0 { 1.0 } else { -1.0 };
         let sz = if k & 4 != 0 { 1.0 } else { -1.0 };
-        let v = center.coords + axes[0] * (sx * he[0]) + axes[1] * (sy * he[1]) + axes[2] * (sz * he[2]);
+        let v = center.coords
+            + axes[0] * (sx * he[0])
+            + axes[1] * (sy * he[1])
+            + axes[2] * (sz * he[2]);
         verts.push([v.x, v.y, v.z]);
     }
     let q = |a, b, c, d| [(a, b, c), (a, c, d)];
@@ -1212,9 +1185,13 @@ fn capsule_mesh(
     }
     // top hemisphere centered at center + half*axis
     let top_c = center.coords + axis * half;
-    push_hemisphere(top_c, axis, u, v, r, sectors, cap_stacks, true, &mut verts, &mut tris);
+    push_hemisphere(
+        top_c, axis, u, v, r, sectors, cap_stacks, true, &mut verts, &mut tris,
+    );
     let bot_c = center.coords - axis * half;
-    push_hemisphere(bot_c, axis, u, v, r, sectors, cap_stacks, false, &mut verts, &mut tris);
+    push_hemisphere(
+        bot_c, axis, u, v, r, sectors, cap_stacks, false, &mut verts, &mut tris,
+    );
     (verts, tris)
 }
 
@@ -1307,12 +1284,7 @@ fn prism_mesh(
     // Cross-section vertices in (ay, az) order, walking the trapezoid:
     //   bot-left: (-hy, -hzb), bot-right: (-hy, +hzb)
     //   top-right: (+hy, +hzt), top-left: (+hy, -hzt)
-    let cross = [
-        (-hy, -hzb),
-        (-hy, hzb),
-        (hy, hzt),
-        (hy, -hzt),
-    ];
+    let cross = [(-hy, -hzb), (-hy, hzb), (hy, hzt), (hy, -hzt)];
     let mut verts = Vec::with_capacity(8);
     for &sx in &[-1.0f32, 1.0f32] {
         for &(y, z) in &cross {

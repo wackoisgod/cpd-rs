@@ -27,9 +27,9 @@ abs_html=$(cd "$(dirname "$HTML")" && pwd)/$(basename "$HTML")
 shoot() {
   local angle=$1
   local out=$2
-  local url="file://$abs_html"
+  local url="file://$abs_html?ui=0"
   if [[ -n "$angle" ]]; then
-    url="$url?angle=$angle"
+    url="file://$abs_html?angle=$angle&ui=0"
   fi
   "$CHROME" \
     --headless=new \
